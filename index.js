@@ -35,9 +35,9 @@ tgClient.addEventHandler(async (event) => {
 
   if (
     sender &&
-    (sender.username === TELEGRAM_SOURCE ||
-      sender.firstName === TELEGRAM_SOURCE ||
-      sender.id.toString() === TELEGRAM_SOURCE)
+    (String(sender.id) === TELEGRAM_SOURCE ||
+      sender.username === TELEGRAM_SOURCE ||
+      sender.firstName === TELEGRAM_SOURCE)
   ) {
     console.log('📩 Новое сообщение из Telegram:', message.message)
     await sendToWhatsApp(message.message)
@@ -57,7 +57,7 @@ async function startWhatsApp({ reset = false } = {}) {
 
   sock = makeWASocket({
     auth: state,
-    browser: Browsers.appropriate('Render', 'Chrome'),
+    browser: ['Render', 'Chrome', '1.0.0'],
   })
 
   sock.ev.on('creds.update', saveCreds)
@@ -68,7 +68,7 @@ async function startWhatsApp({ reset = false } = {}) {
     if (qr) {
       console.log('📱 QR обновлён')
       currentQR = qr
-      // для локального терминала можно оставить ASCII QR
+      // локально показываем ASCII QR для терминала
       qrcode.generate(qr, { small: true })
     } else {
       currentQR = null
@@ -80,8 +80,8 @@ async function startWhatsApp({ reset = false } = {}) {
     }
 
     if (connection === 'close') {
-      console.log('❌ WhatsApp отключён, пробую переподключиться...')
-      startWhatsApp()
+      console.log('❌ WhatsApp отключён, переподключение через 5 секунд...')
+      setTimeout(startWhatsApp, 5000)
     }
   })
 
@@ -115,11 +115,13 @@ async function sendToWhatsApp(text) {
     return
   }
   if (!waGroupJid) await cacheGroupJid()
-  if (waGroupJid) {
+  if (!waGroupJid) return console.log('⚠️ Группа WhatsApp не найдена, сообщение не переслано')
+
+  try {
     await sock.sendMessage(waGroupJid, { text })
     console.log('➡️ Сообщение переслано в WhatsApp')
-  } else {
-    console.log('⚠️ Группа WhatsApp не найдена, сообщение не переслано')
+  } catch (err) {
+    console.error('❌ Ошибка отправки в WhatsApp:', err)
   }
 }
 
@@ -129,14 +131,17 @@ app.use(express.json())
 
 app.get('/', (req, res) => res.send('🤖 Telegram → WhatsApp (Baileys) мост работает'))
 
-// веб-QR для Render
+// веб-QR для Render с автообновлением
 app.get('/wa/qr', (req, res) => {
-  if (!currentQR) return res.send('<h2>✅ WhatsApp уже подключён!</h2>')
-  const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?data=${encodeURIComponent(currentQR)}&size=300x300`
   res.send(`
-    <h2>📱 Сканируйте QR для WhatsApp</h2>
-    <img src="${qrUrl}" />
-    <p>Обновите страницу, если QR устарел.</p>
+    <h2>📱 QR для WhatsApp</h2>
+    <div id="qr">
+      ${currentQR ? `<img src="https://api.qrserver.com/v1/create-qr-code/?data=${encodeURIComponent(currentQR)}&size=300x300" />` : '<p>WhatsApp уже подключён!</p>'}
+    </div>
+    <p>Страница обновляется каждые 15 секунд</p>
+    <script>
+      setInterval(() => location.reload(), 15000)
+    </script>
   `)
 })
 
