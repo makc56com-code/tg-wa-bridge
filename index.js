@@ -19,6 +19,7 @@ const {
 
 let sock = null
 let waGroupJid = null
+let currentQR = null // для веб-QR
 
 // ---------------- Telegram ----------------
 const tgClient = new TelegramClient(
@@ -56,7 +57,6 @@ async function startWhatsApp({ reset = false } = {}) {
 
   sock = makeWASocket({
     auth: state,
-    printQRInTerminal: true,
     browser: Browsers.appropriate('Render', 'Chrome'),
   })
 
@@ -64,14 +64,21 @@ async function startWhatsApp({ reset = false } = {}) {
 
   sock.ev.on('connection.update', (update) => {
     const { connection, lastDisconnect, qr } = update
+
     if (qr) {
-      console.log('📱 Отсканируйте QR для WhatsApp:')
+      console.log('📱 QR обновлён')
+      currentQR = qr
+      // для локального терминала можно оставить ASCII QR
       qrcode.generate(qr, { small: true })
+    } else {
+      currentQR = null
     }
+
     if (connection === 'open') {
       console.log('✅ WhatsApp подключён')
       cacheGroupJid()
     }
+
     if (connection === 'close') {
       console.log('❌ WhatsApp отключён, пробую переподключиться...')
       startWhatsApp()
@@ -121,6 +128,17 @@ const app = express()
 app.use(express.json())
 
 app.get('/', (req, res) => res.send('🤖 Telegram → WhatsApp (Baileys) мост работает'))
+
+// веб-QR для Render
+app.get('/wa/qr', (req, res) => {
+  if (!currentQR) return res.send('<h2>✅ WhatsApp уже подключён!</h2>')
+  const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?data=${encodeURIComponent(currentQR)}&size=300x300`
+  res.send(`
+    <h2>📱 Сканируйте QR для WhatsApp</h2>
+    <img src="${qrUrl}" />
+    <p>Обновите страницу, если QR устарел.</p>
+  `)
+})
 
 app.post('/wa/relogin', async (req, res) => {
   const token = req.query.token || req.headers['x-admin-token']
