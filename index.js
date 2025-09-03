@@ -180,6 +180,11 @@ async function sendToWhatsApp(text) {
 const app = express()
 app.use(express.json())
 
+// 🔹 Новый ping-эндпоинт для UptimeRobot
+app.get('/ping', (req, res) => {
+  res.send('pong')
+})
+
 app.get('/healthz', (req, res) => res.status(200).send('ok'))
 app.get('/', (req, res) => res.send('🤖 Telegram → WhatsApp (Baileys) мост работает'))
 
