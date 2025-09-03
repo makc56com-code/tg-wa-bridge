@@ -1,0 +1,30 @@
+# Проверяем, есть ли изменения
+if (git diff-index --quiet HEAD --) {
+    Write-Host "Нет изменений для коммита"
+} else {
+    git add .
+    git commit -m "Fix Telegram source entity handling and add logging"
+    git push
+}
+
+
+
+Полная перезапись репозитория
+
+# 1. Перейти в папку проекта
+cd "C:\Мост Telegram-WatsApp\В рендер\tg-wa-bridge"
+
+# 2. Удаляем все файлы (кроме скрытой папки .git)
+Get-ChildItem -File -Recurse | Remove-Item -Force
+Get-ChildItem -Directory -Recurse | Where-Object { $_.Name -ne ".git" } | Remove-Item -Recurse -Force
+
+# 3. Скопируйте сюда новые файлы скрипта (или уже разместите их в папке)
+
+# 4. Добавляем новые файлы в Git
+git add .
+
+# 5. Коммитим изменения
+git commit -m "Полная перезапись скрипта"
+
+# 6. Форсированный пуш на GitHub
+git push origin main --force
