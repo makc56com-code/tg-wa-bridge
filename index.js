@@ -19,7 +19,8 @@ const {
 
 let sock = null
 let waGroupJid = null
-let currentQR = null // хранит только актуальный QR
+let currentQR = null
+let lastQR = null // для отслеживания изменений QR
 
 // ---------------- Telegram ----------------
 const tgClient = new TelegramClient(
@@ -65,17 +66,26 @@ async function startWhatsApp({ reset = false } = {}) {
   sock.ev.on('connection.update', (update) => {
     const { connection, qr } = update
 
-    // QR выводится только если его ещё нет
-    if (qr && !currentQR) {
-      console.log('📱 Новый QR получен')
-      currentQR = qr
-      qrcode.generate(qr, { small: true }) // локальный ASCII
-      console.log(`🔗 Ссылка на веб-QR: https://tg-wa-bridge.onrender.com/wa/qr`)
+    console.log('🔄 connection.update:', update)
+
+    if (qr) {
+      if (qr !== lastQR) {
+        console.log('📱 Новый QR получен')
+        currentQR = qr
+        lastQR = qr
+        qrcode.generate(qr, { small: true }) // локальный ASCII
+        console.log(`🔗 Ссылка на веб-QR: https://tg-wa-bridge.onrender.com/wa/qr`)
+      }
+    } else {
+      if (lastQR) {
+        console.log('✅ WhatsApp подключён, QR больше не нужен')
+        lastQR = null
+        currentQR = null
+      }
     }
 
     if (connection === 'open') {
       console.log('✅ WhatsApp подключён')
-      currentQR = null // QR больше не нужен
       cacheGroupJid()
     }
 
@@ -87,7 +97,6 @@ async function startWhatsApp({ reset = false } = {}) {
 
   if (reset) {
     console.log('♻️ Сброс авторизации WhatsApp — ждите новый QR...')
-    currentQR = null
   }
 }
 
