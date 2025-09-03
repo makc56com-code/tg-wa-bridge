@@ -19,7 +19,8 @@ const {
 
 let sock = null
 let waGroupJid = null
-let currentQR = null // для веб-QR
+let currentQR = null
+let lastQR = null // для отслеживания изменений QR
 
 // ---------------- Telegram ----------------
 const tgClient = new TelegramClient(
@@ -63,16 +64,24 @@ async function startWhatsApp({ reset = false } = {}) {
   sock.ev.on('creds.update', saveCreds)
 
   sock.ev.on('connection.update', (update) => {
-    const { connection, lastDisconnect, qr } = update
+    const { connection, qr } = update
 
     console.log('🔄 connection.update:', update)
 
     if (qr) {
-      console.log('📱 Новый QR получен')
-      currentQR = qr
-      qrcode.generate(qr, { small: true }) // для локального терминала
+      if (qr !== lastQR) {
+        console.log('📱 Новый QR получен')
+        currentQR = qr
+        lastQR = qr
+        qrcode.generate(qr, { small: true }) // локальный ASCII
+        console.log(`🔗 Ссылка на веб-QR: https://tg-wa-bridge.onrender.com/wa/qr`)
+      }
     } else {
-      currentQR = null
+      if (lastQR) {
+        console.log('✅ WhatsApp подключён, QR больше не нужен')
+        lastQR = null
+        currentQR = null
+      }
     }
 
     if (connection === 'open') {
@@ -171,7 +180,10 @@ app.post('/wa/relogin', async (req, res) => {
   res.send('OK: relogin started — смотрите логи для QR')
 })
 
-app.listen(Number(PORT), () => console.log(`🌐 HTTP сервер на порту ${PORT}`))
+app.listen(Number(PORT), () => {
+  console.log(`🌐 HTTP сервер на порту ${PORT}`)
+  console.log(`📱 QR для WhatsApp доступен по ссылке: https://tg-wa-bridge.onrender.com/wa/qr`)
+})
 
 // ---------------- Старт ----------------
 ;(async () => {
