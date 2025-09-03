@@ -57,7 +57,7 @@ async function startWhatsApp({ reset = false } = {}) {
 
   sock = makeWASocket({
     auth: state,
-    browser: ['Render', 'Chrome', '1.0.0'],
+    browser: Browsers.appropriate('Render', 'Chrome'),
   })
 
   sock.ev.on('creds.update', saveCreds)
@@ -65,11 +65,12 @@ async function startWhatsApp({ reset = false } = {}) {
   sock.ev.on('connection.update', (update) => {
     const { connection, lastDisconnect, qr } = update
 
+    console.log('🔄 connection.update:', update)
+
     if (qr) {
-      console.log('📱 QR обновлён')
+      console.log('📱 Новый QR получен')
       currentQR = qr
-      // локально показываем ASCII QR для терминала
-      qrcode.generate(qr, { small: true })
+      qrcode.generate(qr, { small: true }) // для локального терминала
     } else {
       currentQR = null
     }
@@ -110,10 +111,7 @@ async function cacheGroupJid() {
 }
 
 async function sendToWhatsApp(text) {
-  if (!sock) {
-    console.log('⏳ Нет активного соединения с WhatsApp')
-    return
-  }
+  if (!sock) return console.log('⏳ Нет активного соединения с WhatsApp')
   if (!waGroupJid) await cacheGroupJid()
   if (!waGroupJid) return console.log('⚠️ Группа WhatsApp не найдена, сообщение не переслано')
 
@@ -131,20 +129,41 @@ app.use(express.json())
 
 app.get('/', (req, res) => res.send('🤖 Telegram → WhatsApp (Baileys) мост работает'))
 
-// веб-QR для Render с автообновлением
+// страница с динамическим QR
 app.get('/wa/qr', (req, res) => {
   res.send(`
     <h2>📱 QR для WhatsApp</h2>
     <div id="qr">
-      ${currentQR ? `<img src="https://api.qrserver.com/v1/create-qr-code/?data=${encodeURIComponent(currentQR)}&size=300x300" />` : '<p>WhatsApp уже подключён!</p>'}
+      <p>Ждём генерации QR...</p>
     </div>
-    <p>Страница обновляется каждые 15 секунд</p>
+    <p>QR обновляется автоматически каждые 5 секунд</p>
     <script>
-      setInterval(() => location.reload(), 15000)
+      async function fetchQR() {
+        try {
+          const r = await fetch('/wa/qr/json')
+          const data = await r.json()
+          const qrDiv = document.getElementById('qr')
+          if (data.qr) {
+            qrDiv.innerHTML = '<img src="https://api.qrserver.com/v1/create-qr-code/?data=' + encodeURIComponent(data.qr) + '&size=300x300" />'
+          } else {
+            qrDiv.innerHTML = '<p>WhatsApp уже подключён!</p>'
+          }
+        } catch (err) {
+          console.error(err)
+        }
+      }
+      setInterval(fetchQR, 5000)
+      fetchQR()
     </script>
   `)
 })
 
+// JSON-эндпоинт для актуального QR
+app.get('/wa/qr/json', (req, res) => {
+  res.json({ qr: currentQR || null })
+})
+
+// ручной релогин
 app.post('/wa/relogin', async (req, res) => {
   const token = req.query.token || req.headers['x-admin-token']
   if (!ADMIN_TOKEN || token !== ADMIN_TOKEN) return res.status(403).send('forbidden')
