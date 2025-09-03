@@ -1,1 +1,22 @@
-{"name":"tg-wa-bridge","version":"1.1.0","description":"Мост между Telegram и WhatsApp (Baileys)","type":"module","scripts":{"start":"node index.js","gen:tg-session":"node init-telegram-session.js"},"dependencies":{"@whiskeysockets/baileys":"^6.7.19","baileys":"^6.7.19","dotenv":"^16.4.5","express":"^4.19.2","input":"^1.0.1","qrcode-terminal":"^0.12.0","telegram":"^2.26.21"},"engines":{"node":"20.x"}}
+{
+  "name": "tg-wa-bridge",
+  "version": "1.2.0",
+  "description": "Мост между Telegram и WhatsApp (Baileys)",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js",
+    "gen:tg-session": "node init-telegram-session.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.19",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.1",
+    "input": "^1.0.1",
+    "qrcode-terminal": "^0.12.0",
+    "qrcode": "^1.5.4",
+    "telegram": "^2.26.21"
+  },
+  "engines": {
+    "node": "20.x"
+  }
+}

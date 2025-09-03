@@ -1,15 +1,12 @@
 services:
-- type: web
-name: tg-wa-bridge
-env: node
-plan: free
-buildCommand: "npm install"
-startCommand: "npm start"
-autoDeploy: true
-envVars:
-- key: PORT
-value: 3000
-healthCheckPath: /
-
-
-# Примечание: free-план Render засыпает при простое, это сервис для тестов/демо.
+  - type: web
+    name: tg-wa-bridge
+    env: node
+    plan: free
+    buildCommand: "npm install"
+    startCommand: "npm start"
+    autoDeploy: true
+    envVars:
+      - key: PORT
+        value: 3000
+    healthCheckPath: /healthz
