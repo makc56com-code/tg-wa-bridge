@@ -152,12 +152,13 @@ async function startWhatsApp({ reset = false } = {}) {
     browser: Browsers.appropriate('Render', 'Chrome')
   })
 
+  let triedReset = false
+  const DOMAIN = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`
+
   sock.ev.on('creds.update', async () => {
     await saveCreds()
     await saveSessionToGist()
   })
-
-  const DOMAIN = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`
 
   sock.ev.on('connection.update', async ({ connection, qr, lastDisconnect }) => {
     if (qr) {
@@ -182,6 +183,15 @@ async function startWhatsApp({ reset = false } = {}) {
     } else if (connection === 'close') {
       const err = lastDisconnect?.error
       console.log('❌ WhatsApp отключён', err ? `(${err?.message || err})` : '')
+
+      // ⚠️ Если сессия невалидна — делаем reset один раз
+      if (!triedReset && err && /auth/i.test(err.message || '')) {
+        console.log('⚠️ Сессия из Gist невалидна, пробуем сбросить и авторизоваться заново')
+        triedReset = true
+        await startWhatsApp({ reset: true })
+        return
+      }
+
       console.log('⏳ Переподключение через 5 секунд...')
       setTimeout(() => startWhatsApp({ reset: false }), 5000)
     }
