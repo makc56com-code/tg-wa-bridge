@@ -1,15 +1,15 @@
 import 'dotenv/config'
 import express from 'express'
-import makeWASocket, { useMultiFileAuthState, Browsers } from '@whiskeysockets/baileys'
+import makeWASocket, { useMultiFileAuthState, Browsers, makeCacheableSignalKeyStore, fetchLatestBaileysVersion } from '@whiskeysockets/baileys'
 import { TelegramClient } from 'telegram'
 import { StringSession } from 'telegram/sessions/index.js'
 import { NewMessage } from 'telegram/events/index.js'
-import qrcode from 'qrcode-terminal'
 import QRCode from 'qrcode'
 import fs from 'fs'
 import axios from 'axios'
 import chalk from 'chalk'
 import { Boom } from '@hapi/boom'
+import P from 'pino'
 
 // ---------------- Конфиг ----------------
 const {
@@ -62,6 +62,8 @@ async function startTelegram() {
 // ---------------- WhatsApp ----------------
 let sock
 let lastQR = null
+let isStartingWA = false
+let saveAuthTimer = null
 
 async function loadAuthFromGist() {
   try {
@@ -69,7 +71,7 @@ async function loadAuthFromGist() {
       headers: { Authorization: `token ${GITHUB_TOKEN}` }
     })
     const files = res.data.files
-    if (!files) return null
+    if (!files) return false
 
     if (!fs.existsSync('./auth_info_baileys')) {
       fs.mkdirSync('./auth_info_baileys')
@@ -81,13 +83,20 @@ async function loadAuthFromGist() {
     return true
   } catch (err) {
     console.log('⚠️ Не удалось загрузить auth из Gist:', err.message)
-    return null
+    return false
   }
+}
+
+function debounceSaveAuth() {
+  if (saveAuthTimer) clearTimeout(saveAuthTimer)
+  saveAuthTimer = setTimeout(saveAuthToGist, 3000)
 }
 
 async function saveAuthToGist() {
   try {
     const files = {}
+    if (!fs.existsSync('./auth_info_baileys')) return
+
     const authFiles = fs.readdirSync('./auth_info_baileys')
     for (const file of authFiles) {
       files[file] = { content: fs.readFileSync(`./auth_info_baileys/${file}`, 'utf-8') }
@@ -104,55 +113,64 @@ async function saveAuthToGist() {
 }
 
 async function startWhatsApp({ reset = false } = {}) {
+  if (isStartingWA) return
+  isStartingWA = true
+
   console.log(chalk.green('🚀 Запуск WhatsApp...'))
 
   if (reset && fs.existsSync('./auth_info_baileys')) {
     fs.rmSync('./auth_info_baileys', { recursive: true, force: true })
   }
 
-  await loadAuthFromGist()
+  const loaded = await loadAuthFromGist()
+  if (!loaded) console.log('⚠️ Сессия не найдена, будет нужна авторизация через QR')
 
   const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys')
+  const { version } = await fetchLatestBaileysVersion()
 
   sock = makeWASocket({
-    auth: state,
+    version,
+    auth: {
+      creds: state.creds,
+      keys: makeCacheableSignalKeyStore(state.keys, P({ level: 'warn' })),
+    },
+    logger: P({ level: 'warn' }),
     browser: Browsers.appropriate('Chrome'),
-    printQRInTerminal: true,
+    printQRInTerminal: false,
   })
 
   sock.ev.on('creds.update', async () => {
     await saveCreds()
-    await saveAuthToGist()
+    debounceSaveAuth()
   })
 
   sock.ev.on('connection.update', ({ connection, lastDisconnect, qr }) => {
     if (qr) {
       lastQR = qr
-      console.clear()
-      qrcode.generate(qr, { small: true })
-      console.log(chalk.yellow('📱 Новый QR доступен и на WebUI /qr'))
+      console.log(chalk.yellow('📱 Новый QR доступен в WebUI /qr'))
     }
     if (connection === 'open') {
       console.log(chalk.green('✅ WhatsApp подключен'))
       sendWelcome()
       lastQR = null
+      // очистка локальной папки после старта
+      if (fs.existsSync('./auth_info_baileys')) {
+        fs.rmSync('./auth_info_baileys', { recursive: true, force: true })
+      }
+      isStartingWA = false
     }
     if (connection === 'close') {
       const statusCode = new Boom(lastDisconnect?.error)?.output?.statusCode
       console.log('⚠️ WhatsApp соединение закрыто', statusCode)
-      if (statusCode !== 401) {
+      isStartingWA = false
+      if (statusCode === 401) {
+        console.log('❌ Сессия недействительна, нужна новая авторизация через QR')
+        startWhatsApp({ reset: true })
+      } else if (statusCode !== 409) { // 409 = conflict
         setTimeout(() => startWhatsApp({ reset: false }), 5000)
       }
     }
   })
-
-  // QR автообновление
-  setInterval(() => {
-    if (sock?.user === undefined) {
-      console.log(chalk.yellow('♻️ Обновление QR...'))
-      sock.logout()
-    }
-  }, 60000)
 }
 
 async function sendToWhatsApp(text) {
@@ -197,7 +215,7 @@ app.get('/', (req, res) => {
 
 app.get('/reset-wa', async (req, res) => {
   if (sock) await sock.logout()
-  res.send('♻️ WA-сессия сброшена, жди новый QR в консоли и на /qr')
+  res.send('♻️ WA-сессия сброшена, жди новый QR в WebUI /qr')
 })
 
 app.get('/status', (req, res) => {
