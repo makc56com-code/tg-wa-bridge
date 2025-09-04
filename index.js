@@ -1,6 +1,6 @@
 import 'dotenv/config'
 import express from 'express'
-import makeWASocket, { useMultiFileAuthState, Browsers, DisconnectReason } from '@whiskeysockets/baileys'
+import makeWASocket, { useMultiFileAuthState, Browsers } from '@whiskeysockets/baileys'
 import { TelegramClient } from 'telegram'
 import { StringSession } from 'telegram/sessions/index.js'
 import { NewMessage } from 'telegram/events/index.js'
@@ -237,6 +237,7 @@ function startQRTimer() {
   },60000)
 }
 
+// ---------------- Группы и приветствие ----------------
 async function cacheGroupJid(sendWelcome=false){
   try{
     console.log(chalk.gray('🔎 Поиск группы WhatsApp:'), WHATSAPP_GROUP_NAME)
@@ -246,8 +247,9 @@ async function cacheGroupJid(sendWelcome=false){
       waGroupJid = target.id
       console.log(chalk.green(`✅ Группа WhatsApp найдена: ${target.subject}`)) 
       if(sendWelcome){
+        const welcome = `[🔧 сервисное сообщение 🔧]\n[🌎 Подключение установлено, РАДАР АКТИВЕН 🚨]`
         console.log(chalk.blue('💬 Отправка сервисного сообщения в WhatsApp'))
-        await sendToWhatsApp('🚨 Радар активен')
+        await sendToWhatsApp(welcome)
       }
     } else {
       waGroupJid = null
