@@ -183,6 +183,8 @@ async function startWhatsApp({ reset = false } = {}) {
   })
 
   sock.ev.on('connection.update', async ({ connection, qr, lastDisconnect }) => {
+    console.log(`📋 [CHECKLIST] connection: ${connection}, QR present: ${!!qr}`)
+    
     if (qr && !sessionLoaded) {
       if (qr !== lastQR) {
         lastQR = qr
@@ -190,9 +192,6 @@ async function startWhatsApp({ reset = false } = {}) {
         qrcodeTerminal.generate(qr, { small: true })
         console.log(`🌍 Откройте QR в браузере: ${DOMAIN}/wa/qr`)
       }
-    } else if (lastQR) {
-      console.log('✅ WhatsApp подключён, QR больше не нужен')
-      lastQR = null
     }
 
     if (connection === 'open') {
@@ -203,11 +202,14 @@ async function startWhatsApp({ reset = false } = {}) {
         const startupMsg = '🔧сервисное сообщение🔧\n[Подключение установлено, РАДАР АКТИВЕН 🌎]'
         await sendToWhatsApp(startupMsg)
       }
-    } else if (connection === 'close') {
+    }
+
+    if (connection === 'close') {
       const err = lastDisconnect?.error
       console.log('❌ WhatsApp отключён', err ? `(${err?.message || err})` : '')
 
-      if (!triedReset && err && /auth/i.test(err.message || '')) {
+      // Проверка ошибки авторизации / сессии
+      if (!triedReset && err && (/auth/i.test(err.message || '') || /QR refs attempts ended/i.test(err.message || ''))) {
         console.log('⚠️ Сессия WhatsApp невалидна или была отвязана вручную, создаём новую...')
         triedReset = true
         await startWhatsApp({ reset: true })
