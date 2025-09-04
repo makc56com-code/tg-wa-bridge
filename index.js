@@ -5,12 +5,10 @@ import { TelegramClient } from 'telegram'
 import { StringSession } from 'telegram/sessions/index.js'
 import { NewMessage } from 'telegram/events/index.js'
 import qrcodeTerminal from 'qrcode-terminal'
-import QRCode from 'qrcode'
 import fs from 'fs'
 import path from 'path'
-import fetch from 'node-fetch' // ✅ Node 20+ ESM
+import fetch from 'node-fetch'
 
-// ---------------- Конфиг ----------------
 const {
   TELEGRAM_API_ID,
   TELEGRAM_API_HASH,
@@ -21,12 +19,11 @@ const {
   PORT = 3000,
   AUTH_DIR = 'auth_info',
   GITHUB_TOKEN,
-  GIST_ID,
+  GIST_ID
 } = process.env
 
 let sock = null
 let waGroupJid = null
-let currentQR = null
 let lastQR = null
 
 // ---------------- Telegram ----------------
@@ -82,6 +79,7 @@ async function initTelegram() {
 function ensureDir(dir) {
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true })
 }
+
 function rmDirSafe(dir) {
   try {
     if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true })
@@ -104,9 +102,9 @@ async function saveSessionToGist() {
       method: 'PATCH',
       headers: {
         Authorization: `token ${GITHUB_TOKEN}`,
-        'Content-Type': 'application/json',
+        'Content-Type': 'application/json'
       },
-      body: JSON.stringify({ files }),
+      body: JSON.stringify({ files })
     })
     console.log('💾 Сессия WhatsApp сохранена в Gist')
   } catch (e) {
@@ -151,7 +149,7 @@ async function startWhatsApp({ reset = false } = {}) {
 
   sock = makeWASocket({
     auth: state,
-    browser: Browsers.appropriate('Render', 'Chrome'),
+    browser: Browsers.appropriate('Render', 'Chrome')
   })
 
   sock.ev.on('creds.update', async () => {
@@ -161,12 +159,9 @@ async function startWhatsApp({ reset = false } = {}) {
 
   const DOMAIN = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`
 
-  sock.ev.on('connection.update', async (update) => {
-    const { connection, qr, lastDisconnect } = update
-
+  sock.ev.on('connection.update', async ({ connection, qr, lastDisconnect }) => {
     if (qr) {
       if (qr !== lastQR) {
-        currentQR = qr
         lastQR = qr
         console.log('📱 Новый QR получен!')
         qrcodeTerminal.generate(qr, { small: true })
@@ -174,14 +169,12 @@ async function startWhatsApp({ reset = false } = {}) {
       }
     } else if (lastQR) {
       console.log('✅ WhatsApp подключён, QR больше не нужен')
-      currentQR = null
       lastQR = null
     }
 
     if (connection === 'open') {
       console.log('✅ WhatsApp подключён')
       await cacheGroupJid()
-      // 🟢 Отправляем сервисное сообщение при подключении
       if (waGroupJid) {
         const startupMsg = '🔧сервисное сообщение🔧\n[Подключение установлено, РАДАР АКТИВЕН 🌎]'
         await sendToWhatsApp(startupMsg)
