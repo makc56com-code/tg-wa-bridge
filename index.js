@@ -15,7 +15,6 @@ const {
   TELEGRAM_STRING_SESSION,
   TELEGRAM_SOURCE,
   WHATSAPP_GROUP_NAME,
-  ADMIN_TOKEN,
   PORT = 3000,
   AUTH_DIR = 'auth_info',
   GITHUB_TOKEN,
@@ -25,6 +24,7 @@ const {
 let sock = null
 let waGroupJid = null
 let lastQR = null
+let sessionLoaded = false
 
 // ---------------- Express ----------------
 const app = express()
@@ -129,7 +129,7 @@ async function saveSessionToGist() {
 }
 
 async function loadSessionFromGist() {
-  if (!GITHUB_TOKEN || !GIST_ID) return
+  if (!GITHUB_TOKEN || !GIST_ID) return false
   try {
     const res = await fetch(`https://api.github.com/gists/${GIST_ID}`, {
       headers: { Authorization: `token ${GITHUB_TOKEN}` }
@@ -137,7 +137,7 @@ async function loadSessionFromGist() {
     const data = await res.json()
     if (!data.files) {
       console.log('⚠️ Сессия из Gist не найдена')
-      return
+      return false
     }
     ensureDir(AUTH_DIR)
     for (const name in data.files) {
@@ -145,8 +145,10 @@ async function loadSessionFromGist() {
       fs.writeFileSync(path.join(AUTH_DIR, name), content, 'utf-8')
     }
     console.log('📥 Сессия WhatsApp загружена из Gist')
+    return true
   } catch (e) {
     console.error('❌ Ошибка загрузки сессии из Gist:', e)
+    return false
   }
 }
 
@@ -155,7 +157,6 @@ async function startWhatsApp({ reset = false } = {}) {
   if (reset) {
     console.log('♻️ Сброс авторизации WhatsApp — удаляю', AUTH_DIR)
     rmDirSafe(AUTH_DIR)
-    console.log('🗑️ Сессия из Gist удалена (локально)')
     if (sock) {
       try { await sock.logout() } catch {}
       try { sock.end && sock.end() } catch {}
@@ -163,7 +164,7 @@ async function startWhatsApp({ reset = false } = {}) {
     }
   }
 
-  await loadSessionFromGist()
+  sessionLoaded = await loadSessionFromGist()
   ensureDir(AUTH_DIR)
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR)
 
@@ -172,8 +173,8 @@ async function startWhatsApp({ reset = false } = {}) {
     browser: Browsers.appropriate('Render', 'Chrome')
   })
 
-  let triedReset = false
   const DOMAIN = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`
+  let triedReset = false
 
   sock.ev.on('creds.update', async () => {
     await saveCreds()
@@ -181,7 +182,7 @@ async function startWhatsApp({ reset = false } = {}) {
   })
 
   sock.ev.on('connection.update', async ({ connection, qr, lastDisconnect }) => {
-    if (qr) {
+    if (qr && !sessionLoaded) {
       if (qr !== lastQR) {
         lastQR = qr
         console.log('📱 Новый QR получен!')
@@ -205,7 +206,7 @@ async function startWhatsApp({ reset = false } = {}) {
       console.log('❌ WhatsApp отключён', err ? `(${err?.message || err})` : '')
 
       if (!triedReset && err && /auth/i.test(err.message || '')) {
-        console.log('⚠️ Сессия из Gist невалидна, пробуем сбросить и авторизоваться заново')
+        console.log('⚠️ Сессия невалидна, создаём новую...')
         triedReset = true
         await startWhatsApp({ reset: true })
         return
