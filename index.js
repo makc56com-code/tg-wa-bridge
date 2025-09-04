@@ -242,12 +242,16 @@ async function cacheGroupJid(sendWelcome=false){
   try{
     console.log(chalk.gray('🔎 Поиск группы WhatsApp:'), WHATSAPP_GROUP_NAME)
     const groups = await sock.groupFetchAllParticipating()
+    const groupNames = Object.values(groups).map(g => g.subject)
+    for(const name of groupNames){
+      console.log(chalk.gray(`🔹 Проверка группы: ${name}`))
+    }
     const target = Object.values(groups).find(g => (g.subject||'').trim().toLowerCase() === (WHATSAPP_GROUP_NAME||'').trim().toLowerCase())
     if(target){ 
       waGroupJid = target.id
       console.log(chalk.green(`✅ Группа WhatsApp найдена: ${target.subject}`)) 
       if(sendWelcome){
-        const welcome = `[🔧 сервисное сообщение 🔧]\n[🌎 Подключение установлено, РАДАР АКТИВЕН 🚨]`
+        const welcome = `[🔧 сервисное сообщение 🔧]\n[🌎 Подключение установлено🌎]\n[🚨РАДАР АКТИВЕН 🚨]`
         console.log(chalk.blue('💬 Отправка сервисного сообщения в WhatsApp'))
         await sendToWhatsApp(welcome)
       }
