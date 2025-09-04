@@ -30,6 +30,8 @@ let waConnectionStatus = 'disconnected'
 let telegramConnected = false
 let qrTimer = null
 
+const TG_SOURCE = TELEGRAM_SOURCE ? TELEGRAM_SOURCE.replace(/^@/, '').toLowerCase() : ''
+
 // ---------------- Express ----------------
 const app = express()
 app.use(express.json())
@@ -39,7 +41,6 @@ app.get('/ping', (req, res) => res.send('pong'))
 app.get('/healthz', (req, res) => res.status(200).send('ok'))
 app.get('/', (req, res) => res.send('🤖 Telegram → WhatsApp мост работает'))
 
-// WhatsApp статус
 app.get('/wa/status', (req, res) => res.send({
   whatsapp: waConnectionStatus,
   telegram: telegramConnected,
@@ -47,14 +48,12 @@ app.get('/wa/status', (req, res) => res.send({
   qrPending: !!lastQR
 }))
 
-// Сброс сессии
 app.post('/wa/reset', async (req, res) => {
   console.log(chalk.yellow('🚨 Ручной сброс сессии WhatsApp через /wa/reset'))
   await startWhatsApp({ reset: true })
   res.send({ status: 'ok', message: 'WhatsApp сессия сброшена и начата новая авторизация' })
 })
 
-// Получение QR-кода для img
 app.get('/wa/qr', (req,res)=>{
   if(!lastQR) return res.status(404).send('QR код пока не сгенерирован')
   import('qrcode').then(QRCode=>{
@@ -65,7 +64,6 @@ app.get('/wa/qr', (req,res)=>{
   })
 })
 
-// Получение QR-кода в ASCII для консоли
 app.get('/wa/qr-ascii', (req,res)=>{
   if(!lastQR) return res.status(404).send('QR код пока не сгенерирован')
   qrcodeTerminal.generate(lastQR,{small:true}, qrcode=>{
@@ -75,7 +73,6 @@ app.get('/wa/qr-ascii', (req,res)=>{
   })
 })
 
-// Отправка текста в WhatsApp
 app.post('/wa/send', async (req,res)=>{
   const text = req.body.text || req.query.text
   if(!text) return res.status(400).send({error:'Text is required'})
@@ -84,7 +81,6 @@ app.post('/wa/send', async (req,res)=>{
   res.send({status:'ok', text})
 })
 
-// Получение списка групп WhatsApp
 app.get('/wa/groups', async (req,res)=>{
   if(!sock) return res.status(500).send({error:'WhatsApp не подключен'})
   try{
@@ -95,7 +91,6 @@ app.get('/wa/groups', async (req,res)=>{
   } catch(e){ console.error(e); res.status(500).send({error:e.message}) }
 })
 
-// Telegram ручная отправка текста
 app.post('/tg/send', async (req,res)=>{
   const text = req.body.text || req.query.text
   if(!text) return res.status(400).send({error:'Text is required'})
@@ -104,28 +99,12 @@ app.post('/tg/send', async (req,res)=>{
   res.send({status:'ok', text})
 })
 
-// Telegram статус
 app.get('/tg/status', (req,res)=>{
   console.log(chalk.blue('📊 /tg/status → Статус Telegram и источник сообщений'))
   res.send({
     telegram: telegramConnected,
     source: TG_SOURCE
   })
-})
-
-app.listen(Number(PORT), () => {
-  console.log(chalk.cyan(`🌐 HTTP сервер на порту ${PORT}`))
-  console.log(chalk.green('💻 Доступные HTTP команды:'))
-  console.log(`${DOMAIN}/ping - проверка доступности сервиса`)
-  console.log(`${DOMAIN}/healthz - health check`)
-  console.log(`${DOMAIN}/wa/status - статус WhatsApp и Telegram`)
-  console.log(`${DOMAIN}/wa/reset - сброс сессии WhatsApp`)
-  console.log(`${DOMAIN}/wa/qr - получить QR-код (img)`)
-  console.log(`${DOMAIN}/wa/qr-ascii - получить QR-код в ASCII`)
-  console.log(`${DOMAIN}/wa/send - отправка текста в WhatsApp (POST/GET text)`)
-  console.log(`${DOMAIN}/wa/groups - получить список групп WhatsApp`)
-  console.log(`${DOMAIN}/tg/send - отправка текста в Telegram (POST/GET text)`)
-  console.log(`${DOMAIN}/tg/status - статус Telegram`)
 })
 
 // ---------------- Telegram ----------------
@@ -136,12 +115,16 @@ const tgClient = new TelegramClient(
   { connectionRetries: 5 }
 )
 
-const TG_SOURCE = TELEGRAM_SOURCE ? TELEGRAM_SOURCE.replace(/^@/, '').toLowerCase() : ''
-
 async function sendTelegramNotification(text) {
   if (!telegramConnected) return
-  try { await tgClient.sendMessage(TG_SOURCE, { message: text }); console.log(chalk.green('📨 Telegram:'), text) }
-  catch(e) { console.error(chalk.red('⚠️ Telegram send failed:'), e) }
+  try {
+    await tgClient.sendMessage(TG_SOURCE, { message: text })
+    console.log(chalk.green('📨 Telegram:'), text)
+    return true
+  } catch(e) { 
+    console.error(chalk.red('⚠️ Telegram send failed:'), e) 
+    return false
+  }
 }
 
 tgClient.addEventHandler(async (event) => {
@@ -151,8 +134,7 @@ tgClient.addEventHandler(async (event) => {
     const sender = await message.getSender()
     const senderIdStr = sender?.id ? String(sender.id) : ''
     const senderUsername = sender?.username ? sender.username.toLowerCase() : ''
-    const senderFirst = sender?.firstName ? sender.firstName.toLowerCase() : ''
-    const isFromSource = senderIdStr === TG_SOURCE || senderUsername === TG_SOURCE || senderFirst === TG_SOURCE
+    const isFromSource = senderUsername === TG_SOURCE || senderIdStr === TG_SOURCE
     if (isFromSource && message.message?.trim()) await sendToWhatsApp(message.message)
   } catch (e) { console.error(chalk.red('⚠️ Telegram event error:'), e) }
 }, new NewMessage({}))
@@ -199,11 +181,18 @@ async function loadSessionFromGist() {
 
 // ---------------- WhatsApp ----------------
 async function startWhatsApp({ reset = false } = {}) {
-  if (reset) { rmDirSafe(AUTH_DIR); sock?.logout?.(); sock?.end?.(); sock = null; sessionLoaded=false; waConnectionStatus='disconnected' }
+  if (reset) { 
+    rmDirSafe(AUTH_DIR)
+    sock?.logout?.(); sock?.end?.(); sock = null; 
+    sessionLoaded=false; waConnectionStatus='disconnected' 
+  }
 
   if (!reset) {
     sessionLoaded = await loadSessionFromGist()
-    if (!sessionLoaded) { console.log(chalk.yellow('⚠️ Сессия из Gist невалидна, сброс...')); return startWhatsApp({ reset:true }) }
+    if (!sessionLoaded) { 
+      console.log(chalk.yellow('⚠️ Сессия из Gist невалидна, сброс...')); 
+      return startWhatsApp({ reset:true }) 
+    }
   }
 
   ensureDir(AUTH_DIR)
@@ -224,6 +213,7 @@ async function startWhatsApp({ reset = false } = {}) {
     }
 
     if (connection==='open') {
+      lastQR = null
       console.log(chalk.green('✅ WhatsApp подключён'))
       sessionLoaded = true
       await cacheGroupJid()
@@ -233,20 +223,32 @@ async function startWhatsApp({ reset = false } = {}) {
     if (connection==='close') {
       console.log(chalk.red('❌ WhatsApp отключён'), lastDisconnect?.error?.message||'')
       await sendTelegramNotification(`❌ WhatsApp отключён`)
+      const shouldRestart = lastDisconnect?.error?.output?.statusCode !== 401
+      if (shouldRestart) setTimeout(()=>startWhatsApp({reset:false}),5000)
       if (!qrTimer) startQRTimer()
-      setTimeout(()=>startWhatsApp({reset:false}),5000)
     }
+  })
+
+  sock.ev.on('messages.upsert', (msg) => {
+    console.log(chalk.gray('📥 Новое сообщение в WhatsApp:'), msg.messages?.[0]?.message?.conversation || '')
+  })
+
+  sock.ev.on('connection.error', (err) => {
+    console.error(chalk.red('❌ Ошибка соединения WhatsApp:'), err)
   })
 }
 
 // Таймер авто-обновления QR каждые 60 секунд
 function startQRTimer() {
   if (qrTimer) clearInterval(qrTimer)
-  qrTimer = setInterval(()=>{ if(waConnectionStatus!=='connected' && sock && sock.authState) sock.ev.emit('connection.update',{connection:'close'}) },60000)
+  qrTimer = setInterval(()=>{
+    if(waConnectionStatus!=='connected' && sock && sock.authState) sock.ev.emit('connection.update',{connection:'close'})
+  },60000)
 }
 
 async function cacheGroupJid() {
   try {
+    console.log(chalk.gray('🔎 Поиск группы WhatsApp:'), WHATSAPP_GROUP_NAME)
     const groups = await sock.groupFetchAllParticipating()
     const target = Object.values(groups).find(g => (g.subject||'').trim().toLowerCase() === (WHATSAPP_GROUP_NAME||'').trim().toLowerCase())
     if(target){ waGroupJid = target.id; console.log(chalk.green(`✅ Группа WhatsApp: ${target.subject}`)) }
@@ -268,6 +270,20 @@ async function sendToWhatsApp(text) {
     console.log(chalk.cyan('🚀 Старт моста Telegram → WhatsApp'))
     await initTelegram()
     await startWhatsApp()
+    app.listen(Number(PORT), () => {
+      console.log(chalk.cyan(`🌐 HTTP сервер на порту ${PORT}`))
+      console.log(chalk.green('💻 Доступные HTTP команды:'))
+      console.log(`${DOMAIN}/ping - проверка доступности сервиса`)
+      console.log(`${DOMAIN}/healthz - health check`)
+      console.log(`${DOMAIN}/wa/status - статус WhatsApp и Telegram`)
+      console.log(`${DOMAIN}/wa/reset - сброс сессии WhatsApp`)
+      console.log(`${DOMAIN}/wa/qr - получить QR-код (img)`)
+      console.log(`${DOMAIN}/wa/qr-ascii - получить QR-код в ASCII`)
+      console.log(`${DOMAIN}/wa/send - отправка текста в WhatsApp (POST/GET text)`)
+      console.log(`${DOMAIN}/wa/groups - получить список групп WhatsApp`)
+      console.log(`${DOMAIN}/tg/send - отправка текста в Telegram (POST/GET text)`)
+      console.log(`${DOMAIN}/tg/status - статус Telegram`)
+    })
     console.log(chalk.green('✅ Мост запущен и работает'))
   } catch(err){ console.error(chalk.red('❌ Ошибка старта:'), err); process.exit(1) }
 })()
