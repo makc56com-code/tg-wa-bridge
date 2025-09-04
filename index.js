@@ -201,7 +201,12 @@ async function startWhatsApp({ reset = false } = {}) {
     waConnectionStatus = 'disconnected'
   }
 
-  sessionLoaded = await loadSessionFromGist()
+  if (!reset) {
+    sessionLoaded = await loadSessionFromGist()
+  } else {
+    sessionLoaded = false
+  }
+
   ensureDir(AUTH_DIR)
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR)
 
