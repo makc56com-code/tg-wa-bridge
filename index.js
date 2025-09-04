@@ -8,7 +8,7 @@ import qrcodeTerminal from 'qrcode-terminal'
 import QRCode from 'qrcode'
 import fs from 'fs'
 import path from 'path'
-import url from 'url'
+import fetch from 'node-fetch'
 
 // ---------------- Конфиг ----------------
 const {
@@ -18,14 +18,16 @@ const {
   TELEGRAM_SOURCE,
   WHATSAPP_GROUP_NAME,
   ADMIN_TOKEN,
-  PORT = process.env.PORT || 3000,
-  AUTH_DIR = process.env.AUTH_DIR || 'auth_info',
+  PORT = 3000,
+  AUTH_DIR = 'auth_info',
+  GITHUB_TOKEN,
+  GIST_ID,
 } = process.env
 
 let sock = null
 let waGroupJid = null
 let currentQR = null
-let lastQR = null // для отслеживания изменений QR
+let lastQR = null
 
 // ---------------- Telegram ----------------
 const tgClient = new TelegramClient(
@@ -35,7 +37,6 @@ const tgClient = new TelegramClient(
   { connectionRetries: 5 }
 )
 
-// нормализуем «источник» из .env (убираем @, пробелы)
 function normSource(v) {
   if (!v) return ''
   return String(v).trim().replace(/^@/, '').toLowerCase()
@@ -47,7 +48,6 @@ tgClient.addEventHandler(async (event) => {
   if (!message) return
   try {
     const sender = await message.getSender()
-
     const senderIdStr = sender?.id ? String(sender.id) : ''
     const senderUsername = sender?.username ? String(sender.username).toLowerCase() : ''
     const senderFirst = sender?.firstName ? String(sender.firstName).toLowerCase() : ''
@@ -78,7 +78,7 @@ async function initTelegram() {
   console.log('👤 Источник сообщений:', TELEGRAM_SOURCE)
 }
 
-// ---------------- Утилиты для AUTH_DIR ----------------
+// ---------------- Утилиты ----------------
 function ensureDir(dir) {
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true })
 }
@@ -90,7 +90,50 @@ function rmDirSafe(dir) {
   }
 }
 
-// ---------------- WhatsApp (Baileys) ----------------
+// ---------------- GitHub Gist ----------------
+async function saveSessionToGist() {
+  if (!GITHUB_TOKEN || !GIST_ID) return
+  try {
+    const files = {}
+    const authFiles = fs.readdirSync(AUTH_DIR)
+    for (const f of authFiles) {
+      const content = fs.readFileSync(path.join(AUTH_DIR, f), 'utf-8')
+      files[f] = { content }
+    }
+    await fetch(`https://api.github.com/gists/${GIST_ID}`, {
+      method: 'PATCH',
+      headers: {
+        Authorization: `token ${GITHUB_TOKEN}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ files }),
+    })
+    console.log('💾 Сессия WhatsApp сохранена в Gist')
+  } catch (e) {
+    console.error('❌ Ошибка сохранения сессии в Gist:', e)
+  }
+}
+
+async function loadSessionFromGist() {
+  if (!GITHUB_TOKEN || !GIST_ID) return
+  try {
+    const res = await fetch(`https://api.github.com/gists/${GIST_ID}`, {
+      headers: { Authorization: `token ${GITHUB_TOKEN}` }
+    })
+    const data = await res.json()
+    if (!data.files) return
+    ensureDir(AUTH_DIR)
+    for (const name in data.files) {
+      const content = data.files[name].content
+      fs.writeFileSync(path.join(AUTH_DIR, name), content, 'utf-8')
+    }
+    console.log('📥 Сессия WhatsApp загружена из Gist')
+  } catch (e) {
+    console.error('❌ Ошибка загрузки сессии из Gist:', e)
+  }
+}
+
+// ---------------- WhatsApp ----------------
 async function startWhatsApp({ reset = false } = {}) {
   if (reset) {
     console.log('♻️ Сброс авторизации WhatsApp — удаляю', AUTH_DIR)
@@ -102,6 +145,7 @@ async function startWhatsApp({ reset = false } = {}) {
     }
   }
 
+  await loadSessionFromGist()
   ensureDir(AUTH_DIR)
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR)
 
@@ -110,9 +154,11 @@ async function startWhatsApp({ reset = false } = {}) {
     browser: Browsers.appropriate('Render', 'Chrome'),
   })
 
-  sock.ev.on('creds.update', saveCreds)
+  sock.ev.on('creds.update', async () => {
+    await saveCreds()
+    await saveSessionToGist()
+  })
 
-  // Render даёт переменную окружения RENDER_EXTERNAL_URL
   const DOMAIN = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`
 
   sock.ev.on('connection.update', (update) => {
@@ -123,9 +169,7 @@ async function startWhatsApp({ reset = false } = {}) {
         currentQR = qr
         lastQR = qr
         console.log('📱 Новый QR получен!')
-        // ASCII QR прямо в логи
         qrcodeTerminal.generate(qr, { small: true })
-        // Ссылка на веб-страницу
         console.log(`🌍 Откройте QR в браузере: ${DOMAIN}/wa/qr`)
       }
     } else if (lastQR) {
@@ -157,6 +201,17 @@ async function cacheGroupJid() {
     if (target) {
       waGroupJid = target.id
       console.log(`✅ Найдена группа WhatsApp: ${target.subject} (${waGroupJid})`)
+
+      // --- Автоматическое сервисное сообщение ---
+      try {
+        const messageText = '[🔧сервисное сообщение🔧]\n[Подключение установлено, РАДАР АКТИВЕН 🌎]'
+        await sock.sendMessage(waGroupJid, { text: messageText })
+        console.log('➡️ Сервисное сообщение отправлено в WhatsApp')
+      } catch (err) {
+        console.error('❌ Ошибка отправки сервисного сообщения:', err)
+      }
+      // -----------------------------------------------
+
     } else {
       console.log(`❌ Группа WhatsApp "${WHATSAPP_GROUP_NAME}" не найдена`)
     }
@@ -178,75 +233,17 @@ async function sendToWhatsApp(text) {
   }
 }
 
-// ---------------- Express (Render + админ) ----------------
+// ---------------- Express ----------------
 const app = express()
 app.use(express.json())
-
-// ping для UptimeRobot
 app.get('/ping', (req, res) => res.send('pong'))
-
 app.get('/healthz', (req, res) => res.status(200).send('ok'))
-app.get('/', (req, res) => res.send('🤖 Telegram → WhatsApp (Baileys) мост работает'))
-
-// Страница с живым QR
+app.get('/', (req, res) => res.send('🤖 Telegram → WhatsApp мост работает'))
 app.get('/wa/qr', async (req, res) => {
-  const html = `
-<!doctype html>
-<html lang="ru">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <title>QR для WhatsApp</title>
-  <style>
-    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 24px; }
-    .wrap { max-width: 520px; margin: 0 auto; text-align: center; }
-    #qrbox { margin-top: 16px; }
-    .muted { color: #666; font-size: 14px; }
-    .badge { display:inline-block; padding:4px 8px; border:1px solid #ddd; border-radius:999px; font-size:12px; }
-  </style>
-</head>
-<body>
-  <div class="wrap">
-    <h2>📱 QR для WhatsApp</h2>
-    <div class="badge">Обновляется каждые ~20 сек</div>
-    <div id="qrbox"><p class="muted">Ждём генерации QR...</p></div>
-    <p class="muted">Если QR пропал — соединение установлено или код устарел, страница обновится автоматически.</p>
-  </div>
-  <script>
-    let last = ''
-    async function draw() {
-      try {
-        const r = await fetch('/wa/qr/json', { cache: 'no-store' })
-        const data = await r.json()
-        const box = document.getElementById('qrbox')
-        if (data.qr && data.qr !== last) {
-          last = data.qr
-          const r2 = await fetch('/wa/qr/svg?data=' + encodeURIComponent(data.qr), { cache: 'no-store' })
-          const svg = await r2.text()
-          box.innerHTML = svg
-        } else if (!data.qr) {
-          box.innerHTML = '<p class="muted">WhatsApp уже подключён</p>'
-        }
-      } catch (e) {
-        console.error(e)
-      }
-    }
-    setInterval(draw, 5000)
-    draw()
-  </script>
-</body>
-</html>
-  `
-  res.setHeader('content-type', 'text/html; charset=utf-8')
+  const html = `<html><body>${currentQR ? 'QR готов' : 'WhatsApp подключён'}</body></html>`
   res.send(html)
 })
-
-// JSON-эндпоинт для QR
-app.get('/wa/qr/json', (req, res) => {
-  res.json({ qr: currentQR || null })
-})
-
-// SVG QR
+app.get('/wa/qr/json', (req, res) => res.json({ qr: currentQR || null }))
 app.get('/wa/qr/svg', async (req, res) => {
   const data = req.query.data
   if (!data) return res.status(400).send('missing data')
@@ -254,23 +251,15 @@ app.get('/wa/qr/svg', async (req, res) => {
     const svg = await QRCode.toString(data, { type: 'svg', margin: 1, width: 320 })
     res.setHeader('content-type', 'image/svg+xml; charset=utf-8')
     res.send(svg)
-  } catch (e) {
-    res.status(500).send('qr error')
-  }
+  } catch (e) { res.status(500).send('qr error') }
 })
-
-// ручной релогин
 app.post('/wa/relogin', async (req, res) => {
   const token = req.query.token || req.headers['x-admin-token']
   if (!ADMIN_TOKEN || token !== ADMIN_TOKEN) return res.status(403).send('forbidden')
   await startWhatsApp({ reset: true })
   res.send('OK: relogin started — смотрите логи для QR')
 })
-
-app.listen(Number(PORT), () => {
-  console.log(`🌐 HTTP сервер на порту ${PORT}`)
-  console.log(`📱 Страница с QR: /wa/qr (относительный путь; домен берите из Render)`)
-})
+app.listen(Number(PORT), () => console.log(`🌐 HTTP сервер на порту ${PORT}`))
 
 // ---------------- Старт ----------------
 ;(async () => {
