@@ -28,45 +28,44 @@ let lastQR = null
 let sessionLoaded = false
 let waConnectionStatus = 'disconnected'
 let telegramConnected = false
+let qrTimer = null
 
 // ---------------- Express ----------------
 const app = express()
 app.use(express.json())
+const DOMAIN = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`
+
 app.get('/ping', (req, res) => res.send('pong'))
 app.get('/healthz', (req, res) => res.status(200).send('ok'))
 app.get('/', (req, res) => res.send('🤖 Telegram → WhatsApp мост работает'))
-
+app.get('/wa/status', (req, res) => res.send({
+  whatsapp: waConnectionStatus,
+  telegram: telegramConnected,
+  waGroup: waGroupJid ? { id: waGroupJid, name: WHATSAPP_GROUP_NAME } : null,
+  qrPending: !!lastQR
+}))
 app.post('/wa/reset', async (req, res) => {
-  try {
-    console.log(chalk.yellow('🚨 Ручной сброс сессии WhatsApp через /wa/reset'))
-    await startWhatsApp({ reset: true })
-    res.send({ status: 'ok', message: 'WhatsApp сессия сброшена и начата новая авторизация' })
-  } catch (err) {
-    console.error(chalk.red('❌ Ошибка при ручном сбросе сессии:'), err)
-    res.status(500).send({ status: 'error', message: err.message })
-  }
+  console.log(chalk.yellow('🚨 Ручной сброс сессии WhatsApp через /wa/reset'))
+  await startWhatsApp({ reset: true })
+  res.send({ status: 'ok', message: 'WhatsApp сессия сброшена и начата новая авторизация' })
+})
+app.get('/wa/qr', (req, res) => {
+  if (!lastQR) return res.status(404).send('QR код пока не сгенерирован')
+  res.setHeader('Content-Type', 'text/plain')
+  res.send(lastQR)
 })
 
-app.get('/wa/status', (req, res) => {
-  res.send({
-    whatsapp: waConnectionStatus,
-    telegram: telegramConnected,
-    waGroup: waGroupJid ? { id: waGroupJid, name: WHATSAPP_GROUP_NAME } : null,
-    qrPending: !!lastQR
-  })
+app.listen(Number(PORT), () => {
+  console.log(chalk.cyan(`🌐 HTTP сервер на порту ${PORT}`))
+  console.log(chalk.green('💻 Доступные HTTP команды:'))
+  console.log(`${DOMAIN}/ping - проверка доступности сервиса`)
+  console.log(`${DOMAIN}/healthz - health check`)
+  console.log(`${DOMAIN}/wa/status - статус WhatsApp и Telegram`)
+  console.log(`${DOMAIN}/wa/reset - сброс сессии WhatsApp`)
+  console.log(`${DOMAIN}/wa/qr - получение текущего QR-кода`)
 })
-
-app.listen(Number(PORT), () => console.log(chalk.cyan(`🌐 HTTP сервер на порту ${PORT}`)))
 
 // ---------------- Telegram ----------------
-console.log(chalk.cyan('🔹 Проверка окружения:'))
-console.log('TELEGRAM_API_ID:', !!TELEGRAM_API_ID)
-console.log('TELEGRAM_API_HASH:', !!TELEGRAM_API_HASH)
-console.log('TELEGRAM_STRING_SESSION:', !!TELEGRAM_STRING_SESSION)
-console.log('GITHUB_TOKEN:', !!GITHUB_TOKEN)
-console.log('GIST_ID:', !!GIST_ID)
-console.log('WHATSAPP_GROUP_NAME:', !!WHATSAPP_GROUP_NAME)
-
 const tgClient = new TelegramClient(
   new StringSession(TELEGRAM_STRING_SESSION),
   Number(TELEGRAM_API_ID),
@@ -74,20 +73,12 @@ const tgClient = new TelegramClient(
   { connectionRetries: 5 }
 )
 
-function normSource(v) {
-  if (!v) return ''
-  return String(v).trim().replace(/^@/, '').toLowerCase()
-}
-const TG_SOURCE = normSource(TELEGRAM_SOURCE)
+const TG_SOURCE = TELEGRAM_SOURCE ? TELEGRAM_SOURCE.replace(/^@/, '').toLowerCase() : ''
 
 async function sendTelegramNotification(text) {
   if (!telegramConnected) return
-  try {
-    await tgClient.sendMessage(TG_SOURCE, { message: text })
-    console.log(chalk.green('📨 Уведомление отправлено в Telegram:'), text)
-  } catch (e) {
-    console.error(chalk.red('⚠️ Не удалось отправить уведомление в Telegram:'), e)
-  }
+  try { await tgClient.sendMessage(TG_SOURCE, { message: text }); console.log(chalk.green('📨 Telegram:'), text) }
+  catch(e) { console.error(chalk.red('⚠️ Telegram send failed:'), e) }
 }
 
 tgClient.addEventHandler(async (event) => {
@@ -96,241 +87,127 @@ tgClient.addEventHandler(async (event) => {
   try {
     const sender = await message.getSender()
     const senderIdStr = sender?.id ? String(sender.id) : ''
-    const senderUsername = sender?.username ? String(sender.username).toLowerCase() : ''
-    const senderFirst = sender?.firstName ? String(sender.firstName).toLowerCase() : ''
-
-    const isFromSource =
-      (!!TG_SOURCE && (
-        senderIdStr === TG_SOURCE ||
-        senderUsername === TG_SOURCE ||
-        senderFirst === TG_SOURCE
-      ))
-
-    if (isFromSource) {
-      const text = message.message || ''
-      if (text.trim().length > 0) {
-        console.log(chalk.cyan('📩 Новое сообщение из Telegram:'), text)
-        await sendToWhatsApp(text)
-      }
-    }
-  } catch (e) {
-    console.error(chalk.red('⚠️ Ошибка обработки события Telegram:'), e)
-  }
+    const senderUsername = sender?.username ? sender.username.toLowerCase() : ''
+    const senderFirst = sender?.firstName ? sender.firstName.toLowerCase() : ''
+    const isFromSource = senderIdStr === TG_SOURCE || senderUsername === TG_SOURCE || senderFirst === TG_SOURCE
+    if (isFromSource && message.message?.trim()) await sendToWhatsApp(message.message)
+  } catch (e) { console.error(chalk.red('⚠️ Telegram event error:'), e) }
 }, new NewMessage({}))
 
 async function initTelegram() {
-  console.log(chalk.cyan('🚀 Запуск Telegram...'))
+  console.log(chalk.cyan('🚀 Подключение к Telegram...'))
   await tgClient.connect()
   telegramConnected = true
-  console.log(chalk.green('✅ Telegram клиент запущен'))
-  console.log('👤 Источник сообщений:', TELEGRAM_SOURCE)
+  console.log(chalk.green('✅ Telegram подключён. Источник сообщений:'), TG_SOURCE)
 }
 
 // ---------------- Утилиты ----------------
-function ensureDir(dir) {
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true })
-}
+function ensureDir(dir) { if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true }) }
+function rmDirSafe(dir) { try { if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true }) } catch(e){console.error(e)} }
 
-function rmDirSafe(dir) {
-  try {
-    if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true })
-  } catch (e) {
-    console.error(chalk.red('⚠️ Не удалось удалить каталог авторизации:'), e)
-  }
-}
-
-// ---------------- GitHub Gist ----------------
+// ---------------- Gist ----------------
 async function saveSessionToGist() {
   if (!GITHUB_TOKEN || !GIST_ID) return
   try {
     const files = {}
     const authFiles = fs.readdirSync(AUTH_DIR)
-    for (const f of authFiles) {
-      const content = fs.readFileSync(path.join(AUTH_DIR, f), 'utf-8')
-      files[f] = { content }
-    }
+    for (const f of authFiles) files[f] = { content: fs.readFileSync(path.join(AUTH_DIR,f),'utf-8') }
     await fetch(`https://api.github.com/gists/${GIST_ID}`, {
       method: 'PATCH',
-      headers: {
-        Authorization: `token ${GITHUB_TOKEN}`,
-        'Content-Type': 'application/json'
-      },
+      headers: { Authorization:`token ${GITHUB_TOKEN}`, 'Content-Type':'application/json' },
       body: JSON.stringify({ files })
     })
-    console.log(chalk.green('💾 Сессия WhatsApp сохранена в Gist (перезаписана)'))
-  } catch (e) {
-    console.error(chalk.red('❌ Ошибка сохранения сессии в Gist:'), e)
-  }
+    console.log(chalk.green('💾 Сессия WhatsApp сохранена в Gist'))
+  } catch(e){ console.error(chalk.red('❌ Ошибка сохранения сессии в Gist:'), e) }
 }
 
 async function loadSessionFromGist() {
   if (!GITHUB_TOKEN || !GIST_ID) return false
   try {
-    const res = await fetch(`https://api.github.com/gists/${GIST_ID}`, {
-      headers: { Authorization: `token ${GITHUB_TOKEN}` }
-    })
+    const res = await fetch(`https://api.github.com/gists/${GIST_ID}`, { headers: { Authorization:`token ${GITHUB_TOKEN}` }})
     const data = await res.json()
-    if (!data.files) {
-      console.log(chalk.yellow('⚠️ Сессия из Gist не найдена'))
-      return false
-    }
+    if (!data.files) { console.log(chalk.yellow('⚠️ Сессия из Gist не найдена')); return false }
     ensureDir(AUTH_DIR)
-    for (const name in data.files) {
-      const content = data.files[name].content
-      fs.writeFileSync(path.join(AUTH_DIR, name), content, 'utf-8')
-    }
+    for (const name in data.files) fs.writeFileSync(path.join(AUTH_DIR,name), data.files[name].content,'utf-8')
     console.log(chalk.green('📥 Сессия WhatsApp загружена из Gist'))
     return true
-  } catch (e) {
-    console.error(chalk.red('❌ Ошибка загрузки сессии из Gist:'), e)
-    return false
-  }
+  } catch(e){ console.error(chalk.red('❌ Ошибка загрузки сессии из Gist:'), e); return false }
 }
 
 // ---------------- WhatsApp ----------------
 async function startWhatsApp({ reset = false } = {}) {
-  if (reset) {
-    console.log(chalk.yellow('♻️ Сброс авторизации WhatsApp — удаляю'), AUTH_DIR)
-    rmDirSafe(AUTH_DIR)
-    if (sock) {
-      try { await sock.logout() } catch {}
-      try { sock.end && sock.end() } catch {}
-      sock = null
-    }
-    sessionLoaded = false
-    waConnectionStatus = 'disconnected'
-  }
+  if (reset) { rmDirSafe(AUTH_DIR); sock?.logout?.(); sock?.end?.(); sock = null; sessionLoaded=false; waConnectionStatus='disconnected' }
 
   if (!reset) {
     sessionLoaded = await loadSessionFromGist()
-  } else {
-    sessionLoaded = false
+    if (!sessionLoaded) { console.log(chalk.yellow('⚠️ Сессия из Gist невалидна, сброс...')); return startWhatsApp({ reset:true }) }
   }
 
   ensureDir(AUTH_DIR)
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR)
+  sock = makeWASocket({ auth: state, browser: Browsers.appropriate('Render','Chrome') })
 
-  sock = makeWASocket({
-    auth: state,
-    browser: Browsers.appropriate('Render', 'Chrome')
-  })
+  sock.ev.on('creds.update', async ()=> { await saveCreds(); await saveSessionToGist() })
 
-  const DOMAIN = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`
-  let triedReset = false
+  sock.ev.on('connection.update', async ({ connection, qr, lastDisconnect })=>{
+    waConnectionStatus = connection==='open'?'connected':connection==='close'?'disconnected':waConnectionStatus
 
-  sock.ev.on('creds.update', async () => {
-    await saveCreds()
-    await saveSessionToGist()
-  })
-
-  sock.ev.on('connection.update', async ({ connection, qr, lastDisconnect }) => {
-    const statusColor = {
-      connected: chalk.green,
-      awaiting_qr: chalk.yellow,
-      disconnected: chalk.red
-    }
-
-    console.log('====================[ WA STATUS CHECKLIST ]====================')
-    console.log(statusColor[waConnectionStatus](`🟢 WhatsApp: ${waConnectionStatus}`))
-    console.log(chalk.cyan(`🔹 Telegram: ${telegramConnected ? 'connected' : 'disconnected'}`))
-    console.log(chalk.yellow(`🔸 QR pending: ${!!lastQR}`))
-    console.log(chalk.magenta(`🔹 Target group: ${waGroupJid || 'не найдено'}`))
-    console.log('================================================================')
-
-    if (qr && !sessionLoaded) {
+    if (qr) {
       lastQR = qr
-      console.log(chalk.yellow('📱 Новый QR получен!'))
-      qrcodeTerminal.generate(qr, { small: true })
-      console.log(chalk.yellow(`🌍 Откройте QR в браузере: ${DOMAIN}/wa/qr`))
-      waConnectionStatus = 'awaiting_qr'
-      await sendTelegramNotification('⚠️ Новый QR для WhatsApp! Требуется авторизация.')
+      waConnectionStatus='awaiting_qr'
+      qrcodeTerminal.generate(qr,{small:true})
+      console.log(chalk.yellow(`🌍 QR код для WhatsApp: ${DOMAIN}/wa/qr`))
+      await sendTelegramNotification('⚠️ Новый QR для WhatsApp')
     }
 
-    if (connection === 'open') {
+    if (connection==='open') {
       console.log(chalk.green('✅ WhatsApp подключён'))
-      waConnectionStatus = 'connected'
       sessionLoaded = true
       await cacheGroupJid()
-      if (waGroupJid) {
-        const startupMsg = '🔧сервисное сообщение🔧\n[Подключение установлено, РАДАР АКТИВЕН 🌎]'
-        await sendToWhatsApp(startupMsg)
-      }
-      await sendTelegramNotification('✅ WhatsApp успешно подключён.')
+      qrTimer && clearInterval(qrTimer)
     }
 
-    if (connection === 'close') {
-      const err = lastDisconnect?.error
-      console.log(chalk.red('❌ WhatsApp отключён'), err ? `(${err?.message || err})` : '')
-      waConnectionStatus = 'disconnected'
-      await sendTelegramNotification(`❌ WhatsApp отключён ${err ? `(${err.message || err})` : ''}`)
-
-      if (!triedReset && err && (/auth/i.test(err.message || '') || /QR refs attempts ended/i.test(err.message || ''))) {
-        console.log(chalk.yellow('⚠️ Сессия WhatsApp невалидна или была отвязана вручную, создаём новую...'))
-        triedReset = true
-        await startWhatsApp({ reset: true })
-        return
-      }
-
-      console.log(chalk.yellow('⏳ Переподключение через 5 секунд...'))
-      setTimeout(() => startWhatsApp({ reset: false }), 5000)
+    if (connection==='close') {
+      console.log(chalk.red('❌ WhatsApp отключён'), lastDisconnect?.error?.message||'')
+      await sendTelegramNotification(`❌ WhatsApp отключён`)
+      if (!qrTimer) startQRTimer()
+      setTimeout(()=>startWhatsApp({reset:false}),5000)
     }
   })
+}
+
+// Таймер авто-обновления QR каждые 60 секунд, если соединение не open
+function startQRTimer() {
+  if (qrTimer) clearInterval(qrTimer)
+  qrTimer = setInterval(()=>{ if(waConnectionStatus!=='connected' && sock && sock.authState) sock.ev.emit('connection.update',{connection:'close'}) },60000)
 }
 
 async function cacheGroupJid() {
   try {
     const groups = await sock.groupFetchAllParticipating()
-    const target = Object.values(groups).find(
-      (g) =>
-        (g.subject || '').trim().toLowerCase() ===
-        (WHATSAPP_GROUP_NAME || '').trim().toLowerCase()
-    )
-    if (target) {
-      waGroupJid = target.id
-      console.log(chalk.green(`✅ Найдена группа WhatsApp: ${target.subject} (${waGroupJid})`))
-    } else {
-      console.log(chalk.red(`❌ Группа WhatsApp "${WHATSAPP_GROUP_NAME}" не найдена`))
-      await sendTelegramNotification(`❌ Группа WhatsApp "${WHATSAPP_GROUP_NAME}" не найдена`)
-    }
-  } catch (e) {
-    console.error(chalk.red('❌ Ошибка получения списка групп:'), e)
-    await sendTelegramNotification(`❌ Ошибка получения списка групп WhatsApp: ${e.message || e}`)
-  }
+    const target = Object.values(groups).find(g => (g.subject||'').trim().toLowerCase() === (WHATSAPP_GROUP_NAME||'').trim().toLowerCase())
+    if(target){ waGroupJid = target.id; console.log(chalk.green(`✅ Группа WhatsApp: ${target.subject}`)) }
+    else { waGroupJid = null; console.log(chalk.red('❌ Группа WhatsApp не найдена')) }
+  } catch(e){ console.error(chalk.red('❌ Ошибка получения списка групп:'), e) }
 }
 
 async function sendToWhatsApp(text) {
-  if (!sock) {
-    console.log(chalk.yellow('⏳ Нет активного соединения с WhatsApp'))
-    await sendTelegramNotification('⚠️ Попытка отправки сообщения в WhatsApp, но соединение отсутствует.')
-    return
-  }
-  if (!waGroupJid) await cacheGroupJid()
-  if (!waGroupJid) {
-    await sendTelegramNotification('⚠️ Сообщение не отправлено: группа WhatsApp не найдена.')
-    return
-  }
-
-  try {
-    await sock.sendMessage(waGroupJid, { text })
-    console.log(chalk.green('➡️ Сообщение переслано в WhatsApp'))
-  } catch (err) {
-    console.error(chalk.red('❌ Ошибка отправки в WhatsApp:'), err)
-    await sendTelegramNotification(`❌ Ошибка отправки сообщения в WhatsApp: ${err.message || err}`)
-  }
+  if(!sock){ console.log(chalk.yellow('⏳ WhatsApp не подключен')); return }
+  if(!waGroupJid) await cacheGroupJid()
+  if(!waGroupJid){ console.log(chalk.red('❌ Группа WhatsApp не найдена')); return }
+  try{ await sock.sendMessage(waGroupJid,{text}); console.log(chalk.green('➡️ Отправлено в WhatsApp')) }
+  catch(e){ console.error(chalk.red('❌ Ошибка отправки:'), e) }
 }
 
 // ---------------- Старт ----------------
-;(async () => {
+;(async ()=>{
   try {
-    console.log(chalk.cyan('🚀 Старт моста Telegram → WhatsApp...'))
+    console.log(chalk.cyan('🚀 Старт моста Telegram → WhatsApp'))
     await initTelegram()
     await startWhatsApp()
     console.log(chalk.green('✅ Мост запущен и работает'))
-  } catch (err) {
-    console.error(chalk.red('❌ Ошибка запуска:'), err)
-    process.exit(1)
-  }
+  } catch(err){ console.error(chalk.red('❌ Ошибка старта:'), err); process.exit(1) }
 })()
 
-process.on('SIGINT', () => process.exit(0))
-process.on('SIGTERM', () => process.exit(0))
+process.on('SIGINT',()=>process.exit(0))
+process.on('SIGTERM',()=>process.exit(0))
