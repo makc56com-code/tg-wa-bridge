@@ -8,7 +8,7 @@ import qrcodeTerminal from 'qrcode-terminal'
 import QRCode from 'qrcode'
 import fs from 'fs'
 import path from 'path'
-import fetch from 'node-fetch'
+import fetch from 'node-fetch' // ✅ Node 20+ ESM
 
 // ---------------- Конфиг ----------------
 const {
@@ -161,7 +161,7 @@ async function startWhatsApp({ reset = false } = {}) {
 
   const DOMAIN = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`
 
-  sock.ev.on('connection.update', (update) => {
+  sock.ev.on('connection.update', async (update) => {
     const { connection, qr, lastDisconnect } = update
 
     if (qr) {
@@ -180,7 +180,12 @@ async function startWhatsApp({ reset = false } = {}) {
 
     if (connection === 'open') {
       console.log('✅ WhatsApp подключён')
-      cacheGroupJid()
+      await cacheGroupJid()
+      // 🟢 Отправляем сервисное сообщение при подключении
+      if (waGroupJid) {
+        const startupMsg = '🔧сервисное сообщение🔧\n[Подключение установлено, РАДАР АКТИВЕН 🌎]'
+        await sendToWhatsApp(startupMsg)
+      }
     } else if (connection === 'close') {
       const err = lastDisconnect?.error
       console.log('❌ WhatsApp отключён', err ? `(${err?.message || err})` : '')
@@ -201,17 +206,6 @@ async function cacheGroupJid() {
     if (target) {
       waGroupJid = target.id
       console.log(`✅ Найдена группа WhatsApp: ${target.subject} (${waGroupJid})`)
-
-      // --- Автоматическое сервисное сообщение ---
-      try {
-        const messageText = '[🔧сервисное сообщение🔧]\n[Подключение установлено, РАДАР АКТИВЕН 🌎]'
-        await sock.sendMessage(waGroupJid, { text: messageText })
-        console.log('➡️ Сервисное сообщение отправлено в WhatsApp')
-      } catch (err) {
-        console.error('❌ Ошибка отправки сервисного сообщения:', err)
-      }
-      // -----------------------------------------------
-
     } else {
       console.log(`❌ Группа WhatsApp "${WHATSAPP_GROUP_NAME}" не найдена`)
     }
@@ -239,26 +233,6 @@ app.use(express.json())
 app.get('/ping', (req, res) => res.send('pong'))
 app.get('/healthz', (req, res) => res.status(200).send('ok'))
 app.get('/', (req, res) => res.send('🤖 Telegram → WhatsApp мост работает'))
-app.get('/wa/qr', async (req, res) => {
-  const html = `<html><body>${currentQR ? 'QR готов' : 'WhatsApp подключён'}</body></html>`
-  res.send(html)
-})
-app.get('/wa/qr/json', (req, res) => res.json({ qr: currentQR || null }))
-app.get('/wa/qr/svg', async (req, res) => {
-  const data = req.query.data
-  if (!data) return res.status(400).send('missing data')
-  try {
-    const svg = await QRCode.toString(data, { type: 'svg', margin: 1, width: 320 })
-    res.setHeader('content-type', 'image/svg+xml; charset=utf-8')
-    res.send(svg)
-  } catch (e) { res.status(500).send('qr error') }
-})
-app.post('/wa/relogin', async (req, res) => {
-  const token = req.query.token || req.headers['x-admin-token']
-  if (!ADMIN_TOKEN || token !== ADMIN_TOKEN) return res.status(403).send('forbidden')
-  await startWhatsApp({ reset: true })
-  res.send('OK: relogin started — смотрите логи для QR')
-})
 app.listen(Number(PORT), () => console.log(`🌐 HTTP сервер на порту ${PORT}`))
 
 // ---------------- Старт ----------------
