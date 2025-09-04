@@ -38,21 +38,79 @@ const DOMAIN = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`
 app.get('/ping', (req, res) => res.send('pong'))
 app.get('/healthz', (req, res) => res.status(200).send('ok'))
 app.get('/', (req, res) => res.send('🤖 Telegram → WhatsApp мост работает'))
+
+// WhatsApp статус
 app.get('/wa/status', (req, res) => res.send({
   whatsapp: waConnectionStatus,
   telegram: telegramConnected,
   waGroup: waGroupJid ? { id: waGroupJid, name: WHATSAPP_GROUP_NAME } : null,
   qrPending: !!lastQR
 }))
+
+// Сброс сессии
 app.post('/wa/reset', async (req, res) => {
   console.log(chalk.yellow('🚨 Ручной сброс сессии WhatsApp через /wa/reset'))
   await startWhatsApp({ reset: true })
   res.send({ status: 'ok', message: 'WhatsApp сессия сброшена и начата новая авторизация' })
 })
-app.get('/wa/qr', (req, res) => {
-  if (!lastQR) return res.status(404).send('QR код пока не сгенерирован')
-  res.setHeader('Content-Type', 'text/plain')
-  res.send(lastQR)
+
+// Получение QR-кода для img
+app.get('/wa/qr', (req,res)=>{
+  if(!lastQR) return res.status(404).send('QR код пока не сгенерирован')
+  import('qrcode').then(QRCode=>{
+    QRCode.toDataURL(lastQR).then(url=>{
+      console.log(chalk.yellow('🌍 QR URL для WhatsApp: '), DOMAIN+'/wa/qr')
+      res.send(`<img src="${url}"/>`)
+    }).catch(e=>res.status(500).send(e))
+  })
+})
+
+// Получение QR-кода в ASCII для консоли
+app.get('/wa/qr-ascii', (req,res)=>{
+  if(!lastQR) return res.status(404).send('QR код пока не сгенерирован')
+  qrcodeTerminal.generate(lastQR,{small:true}, qrcode=>{
+    console.log(chalk.yellow('🌍 QR ASCII для WhatsApp:')); console.log(qrcode)
+    res.setHeader('Content-Type','text/plain')
+    res.send(qrcode)
+  })
+})
+
+// Отправка текста в WhatsApp
+app.post('/wa/send', async (req,res)=>{
+  const text = req.body.text || req.query.text
+  if(!text) return res.status(400).send({error:'Text is required'})
+  console.log(chalk.blue('✉️ /wa/send → Отправка текста в WhatsApp:'), text)
+  await sendToWhatsApp(text)
+  res.send({status:'ok', text})
+})
+
+// Получение списка групп WhatsApp
+app.get('/wa/groups', async (req,res)=>{
+  if(!sock) return res.status(500).send({error:'WhatsApp не подключен'})
+  try{
+    const groups = await sock.groupFetchAllParticipating()
+    const groupList = Object.values(groups).map(g=>({id:g.id, name:g.subject}))
+    console.log(chalk.blue('📋 /wa/groups → Список групп WhatsApp получен'))
+    res.send(groupList)
+  } catch(e){ console.error(e); res.status(500).send({error:e.message}) }
+})
+
+// Telegram ручная отправка текста
+app.post('/tg/send', async (req,res)=>{
+  const text = req.body.text || req.query.text
+  if(!text) return res.status(400).send({error:'Text is required'})
+  console.log(chalk.blue('✉️ /tg/send → Отправка текста в Telegram:'), text)
+  await sendTelegramNotification(text)
+  res.send({status:'ok', text})
+})
+
+// Telegram статус
+app.get('/tg/status', (req,res)=>{
+  console.log(chalk.blue('📊 /tg/status → Статус Telegram и источник сообщений'))
+  res.send({
+    telegram: telegramConnected,
+    source: TG_SOURCE
+  })
 })
 
 app.listen(Number(PORT), () => {
@@ -62,7 +120,12 @@ app.listen(Number(PORT), () => {
   console.log(`${DOMAIN}/healthz - health check`)
   console.log(`${DOMAIN}/wa/status - статус WhatsApp и Telegram`)
   console.log(`${DOMAIN}/wa/reset - сброс сессии WhatsApp`)
-  console.log(`${DOMAIN}/wa/qr - получение текущего QR-кода`)
+  console.log(`${DOMAIN}/wa/qr - получить QR-код (img)`)
+  console.log(`${DOMAIN}/wa/qr-ascii - получить QR-код в ASCII`)
+  console.log(`${DOMAIN}/wa/send - отправка текста в WhatsApp (POST/GET text)`)
+  console.log(`${DOMAIN}/wa/groups - получить список групп WhatsApp`)
+  console.log(`${DOMAIN}/tg/send - отправка текста в Telegram (POST/GET text)`)
+  console.log(`${DOMAIN}/tg/status - статус Telegram`)
 })
 
 // ---------------- Telegram ----------------
@@ -176,7 +239,7 @@ async function startWhatsApp({ reset = false } = {}) {
   })
 }
 
-// Таймер авто-обновления QR каждые 60 секунд, если соединение не open
+// Таймер авто-обновления QR каждые 60 секунд
 function startQRTimer() {
   if (qrTimer) clearInterval(qrTimer)
   qrTimer = setInterval(()=>{ if(waConnectionStatus!=='connected' && sock && sock.authState) sock.ev.emit('connection.update',{connection:'close'}) },60000)
