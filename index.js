@@ -162,14 +162,14 @@ async function saveSessionToGist(stateFiles) {
 }
 
 async function loadSessionFromGist() {
-  if (!GITHUB_TOKEN || !GIST_ID) return false
+  if (!GITHUB_TOKEN || !GIST_ID) return null
   try {
     const res = await fetch(`https://api.github.com/gists/${GIST_ID}`, { headers: { Authorization:`token ${GITHUB_TOKEN}` }})
     const data = await res.json()
-    if(!data.files) { console.log(chalk.yellow('⚠️ Сессия из Gist не найдена')); return false }
+    if(!data.files) { console.log(chalk.yellow('⚠️ Сессия из Gist не найдена')); return null }
     console.log(chalk.green('📥 Сессия WhatsApp загружена из Gist'))
     return Object.fromEntries(Object.entries(data.files).map(([k,v]) => [k,v.content]))
-  } catch(e){ console.error(chalk.red('❌ Ошибка загрузки сессии из Gist:'), e); return false }
+  } catch(e){ console.error(chalk.red('❌ Ошибка загрузки сессии из Gist:'), e); return null }
 }
 
 // ---------------- WhatsApp ----------------
@@ -179,10 +179,19 @@ async function startWhatsApp({ reset=false } = {}) {
     sessionLoaded=false; waConnectionStatus='disconnected'
   }
 
+  // Попытка загрузить сессию из Gist
   let authStateFiles = reset ? null : await loadSessionFromGist()
   sessionLoaded = !!authStateFiles
 
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR)
+
+  // Если есть сессия из Gist и мы её не сбрасываем, используем её
+  if(authStateFiles){
+    for(const f of Object.keys(authStateFiles)){
+      fs.writeFileSync(path.join(AUTH_DIR,f), authStateFiles[f],'utf-8')
+    }
+  }
+
   sock = makeWASocket({ auth: state, browser: Browsers.appropriate('Render','Chrome') })
 
   sock.ev.on('creds.update', async () => {
@@ -195,7 +204,8 @@ async function startWhatsApp({ reset=false } = {}) {
   sock.ev.on('connection.update', async ({ connection, qr, lastDisconnect }) => {
     waConnectionStatus = connection==='open'?'connected':connection==='close'?'disconnected':waConnectionStatus
 
-    if(qr){
+    // QR только если реально нужен
+    if(qr && waConnectionStatus !== 'connected'){
       lastQR = qr
       waConnectionStatus='awaiting_qr'
       qrcodeTerminal.generate(qr,{small:true})
@@ -251,7 +261,7 @@ async function cacheGroupJid(sendWelcome=false){
       waGroupJid = target.id
       console.log(chalk.green(`✅ Группа WhatsApp найдена: ${target.subject}`)) 
       if(sendWelcome){
-        const welcome = `[🔧 сервисное сообщение 🔧]\n[🌎 Подключение установлено🌎]\n[🚨РАДАР АКТИВЕН 🚨]`
+        const welcome = `[🔧 сервисное сообщение 🔧]\n[🌎подключено🌎]\n[🚨РАДАР АКТИВЕН 🚨]`
         console.log(chalk.blue('💬 Отправка сервисного сообщения в WhatsApp'))
         await sendToWhatsApp(welcome)
       }
