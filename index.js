@@ -216,8 +216,10 @@ async function startWhatsApp({ reset = false } = {}) {
       lastQR = null
       console.log(chalk.green('✅ WhatsApp подключён'))
       sessionLoaded = true
-      await cacheGroupJid()
       qrTimer && clearInterval(qrTimer)
+
+      // Найти группу и отправить сервисное сообщение
+      await cacheGroupJid(true)
     }
 
     if (connection==='close') {
@@ -246,14 +248,27 @@ function startQRTimer() {
   },60000)
 }
 
-async function cacheGroupJid() {
+async function cacheGroupJid(sendWelcome=false) {
   try {
     console.log(chalk.gray('🔎 Поиск группы WhatsApp:'), WHATSAPP_GROUP_NAME)
     const groups = await sock.groupFetchAllParticipating()
     const target = Object.values(groups).find(g => (g.subject||'').trim().toLowerCase() === (WHATSAPP_GROUP_NAME||'').trim().toLowerCase())
-    if(target){ waGroupJid = target.id; console.log(chalk.green(`✅ Группа WhatsApp: ${target.subject}`)) }
-    else { waGroupJid = null; console.log(chalk.red('❌ Группа WhatsApp не найдена')) }
-  } catch(e){ console.error(chalk.red('❌ Ошибка получения списка групп:'), e) }
+
+    if(target){ 
+      waGroupJid = target.id
+      console.log(chalk.green(`✅ Группа WhatsApp найдена: ${target.subject}`)) 
+
+      if(sendWelcome){
+        console.log(chalk.blue('💬 Отправка сервисного сообщения в WhatsApp'))
+        await sendToWhatsApp('🚨 Радар активен')
+      }
+    } else { 
+      waGroupJid = null
+      console.log(chalk.red('❌ Группа WhatsApp не найдена')) 
+    }
+  } catch(e){ 
+    console.error(chalk.red('❌ Ошибка получения списка групп:'), e) 
+  }
 }
 
 async function sendToWhatsApp(text) {
