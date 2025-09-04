@@ -162,6 +162,7 @@ async function startWhatsApp({ reset = false } = {}) {
       try { sock.end && sock.end() } catch {}
       sock = null
     }
+    sessionLoaded = false
   }
 
   sessionLoaded = await loadSessionFromGist()
@@ -196,6 +197,7 @@ async function startWhatsApp({ reset = false } = {}) {
 
     if (connection === 'open') {
       console.log('✅ WhatsApp подключён')
+      sessionLoaded = true
       await cacheGroupJid()
       if (waGroupJid) {
         const startupMsg = '🔧сервисное сообщение🔧\n[Подключение установлено, РАДАР АКТИВЕН 🌎]'
@@ -206,7 +208,7 @@ async function startWhatsApp({ reset = false } = {}) {
       console.log('❌ WhatsApp отключён', err ? `(${err?.message || err})` : '')
 
       if (!triedReset && err && /auth/i.test(err.message || '')) {
-        console.log('⚠️ Сессия невалидна, создаём новую...')
+        console.log('⚠️ Сессия WhatsApp невалидна или была отвязана вручную, создаём новую...')
         triedReset = true
         await startWhatsApp({ reset: true })
         return
