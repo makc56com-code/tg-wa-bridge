@@ -18,6 +18,57 @@ import axios from 'axios'
 import chalk from 'chalk'
 import P from 'pino'
 import { Boom } from '@hapi/boom'
+import util from 'util'
+
+// ----------------- NOISY LOGS FILTER -----------------
+// Список подстрок, при наличии которых строка будет подавлена.
+// Добавляйте/убирайте элементы при необходимости.
+const SUPPRESS_PATTERNS = [
+  'Closing stale open session',
+  'Closing session: SessionEntry',
+  'SessionEntry',
+  'ephemeralKeyPair',
+  'privKey: <Buffer',
+  'pubKey: <Buffer',
+  'currentRatchet',
+  'lastRemoteEphemeralKey',
+  'rootKey',
+  'preKeyId:',
+  'chainKey: [Object]',
+  'messageKeys: {}'
+]
+
+function shouldSuppressLogLine(s) {
+  if (!s) return false
+  try {
+    for (const p of SUPPRESS_PATTERNS) {
+      if (s.indexOf(p) !== -1) return true
+    }
+  } catch (e) {}
+  return false
+}
+
+// Backup original consoles
+const _origLog = console.log.bind(console)
+const _origInfo = console.info.bind(console)
+const _origWarn = console.warn.bind(console)
+const _origError = console.error.bind(console)
+
+// Override console.* to filter noisy lines
+;['log','info','warn','error'].forEach(level => {
+  const orig = { log: _origLog, info: _origInfo, warn: _origWarn, error: _origError }[level]
+  console[level] = (...args) => {
+    try {
+      const s = util.format(...args)
+      if (shouldSuppressLogLine(s)) return
+      orig(s)
+    } catch (e) {
+      // if something goes wrong, fall back to original
+      orig(...args)
+    }
+  }
+})
+// ----------------- end filter -----------------
 
 // ---- env/config ----
 const {
@@ -33,7 +84,8 @@ const {
   GITHUB_TOKEN,
   GIST_ID,
   AUTH_DIR = '/tmp/auth_info_baileys',
-  ADMIN_TOKEN = 'admin-token'
+  ADMIN_TOKEN = 'admin-token',
+  LOG_LEVEL
 } = process.env
 
 const CONFIG_GROUP_ID = (WA_GROUP_ID && WA_GROUP_ID.trim()) ? WA_GROUP_ID.trim() : (WHATSAPP_GROUP_ID && WHATSAPP_GROUP_ID.trim() ? WHATSAPP_GROUP_ID.trim() : null)
@@ -65,7 +117,7 @@ let cachedGroupJid = null
 let lastConflictAt = 0
 let conflictCount = 0
 
-const PLOGGER = P({ level: 'warn' })
+const PLOGGER = P({ level: LOG_LEVEL || 'error' }) // по умолчанию 'error' — минимально
 const UI_DOMAIN = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`
 
 // ---- Gist helpers ----
@@ -293,10 +345,8 @@ async function startWhatsApp({ reset = false } = {}) {
           warnLog('⚠️ Stream conflict (440). conflictCount=' + conflictCount)
           if (conflictCount >= 3) {
             warnLog('❌ Conflict повторился 3 раза — считаем, что сессия заменена. Запрашиваем новый QR (reset=true)')
-            // force fresh auth flow
             scheduleRestart({ reset: true })
           } else {
-            // give cooldown and try soft restart (no reset)
             scheduleRestart({ reset: false })
           }
         } else if ([401, 428].includes(code)) {
