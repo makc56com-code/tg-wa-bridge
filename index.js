@@ -170,7 +170,6 @@ async function onTelegramMessage(event) {
 function scheduleRestart({ reset = false } = {}) {
   if (restartTimer) return
   restartCount = Math.min(restartCount + 1, 8)
-  // exponential backoff capped
   const delay = Math.min(60000, Math.pow(2, restartCount) * 1000)
   infoLog(`ℹ️ Планируем рестарт WA через ${Math.round(delay/1000)}s (reset=${reset}, retryCount=${restartCount})`)
   restartTimer = setTimeout(() => {
@@ -189,20 +188,18 @@ async function startWhatsApp({ reset = false } = {}) {
   isStartingWA = true
   waConnectionStatus = 'connecting'
   infoLog(`🚀 Запуск WhatsApp... reset=${reset}`)
+  infoLog(`🔎 Ищем группу по WA_GROUP_ID='${WA_GROUP_ID || ''}' WA_GROUP_NAME='${WA_GROUP_NAME || ''}'`)
 
   try { fs.mkdirSync(AUTH_DIR, { recursive: true }) } catch (e) {}
 
-  // if reset is false => try load from Gist; if reset true => skip loading Gist (we want fresh QR)
   if (!reset) {
     await loadAuthFromGistToDir(AUTH_DIR).catch(()=>{})
   } else {
-    // wipe local auth to start fresh flow
     try { fs.rmSync(AUTH_DIR, { recursive: true, force: true }); fs.mkdirSync(AUTH_DIR, { recursive: true }) } catch (e) {}
     lastQR = null
     infoLog('ℹ️ Подготовлено пустое AUTH_DIR для новой авторизации')
   }
 
-  // initialize auth state (will create files if absent)
   let state, saveCreds
   try {
     ({ state, saveCreds } = await useMultiFileAuthState(AUTH_DIR))
@@ -213,11 +210,9 @@ async function startWhatsApp({ reset = false } = {}) {
     return
   }
 
-  // fetch latest baileys version (optional)
   let version = undefined
   try { version = (await fetchLatestBaileysVersion()).version } catch (e) {}
 
-  // create socket
   try {
     sock = makeWASocket({
       version,
@@ -236,7 +231,6 @@ async function startWhatsApp({ reset = false } = {}) {
     return
   }
 
-  // creds update -> saveCreds + debounce save to gist
   sock.ev.on('creds.update', async () => {
     try { await saveCreds() } catch (e) {}
     debounceSaveAuthToGist(AUTH_DIR)
@@ -257,10 +251,8 @@ async function startWhatsApp({ reset = false } = {}) {
         waConnectionStatus = 'connected'
         restartCount = 0
         infoLog('✅ WhatsApp подключён')
-        // persist creds immediately to gist (debounced as well)
         try { await saveCreds() } catch (e) {}
         debounceSaveAuthToGist(AUTH_DIR)
-        // cache group
         try { await cacheGroupId(true) } catch (e) { warnLog('⚠️ cacheGroupId failed: ' + (e?.message || e)) }
         lastQR = null
         isStartingWA = false
@@ -272,15 +264,11 @@ async function startWhatsApp({ reset = false } = {}) {
         let code = null
         try { code = new Boom(lastDisconnect?.error)?.output?.statusCode } catch (e) { code = lastDisconnect?.error?.output?.statusCode || null }
         warnLog('⚠️ WhatsApp соединение закрыто ' + (code || 'unknown'))
-        // attempt to close socket
         try { await sock?.end?.() } catch (e) {}
-        // decision:
         if ([401, 428].includes(code)) {
-          // invalid credentials -> must do a fresh auth via QR (do NOT reload gist on next attempt)
           warnLog('❌ Сессия недействительна — запустим flow с новой авторизацией (QR)')
           scheduleRestart({ reset: true })
         } else if ([409].includes(code)) {
-          // conflict - don't spam restarts; schedule gentle retry
           warnLog('⚠️ Conflict (409) — ожидание, не форсируем рестарт')
           scheduleRestart({ reset: false })
         } else {
@@ -304,35 +292,92 @@ async function startWhatsApp({ reset = false } = {}) {
   sock.ev.on('connection.error', (err) => { warnLog('⚠️ connection.error: ' + (err?.message || err)) })
 }
 
-// ---- groups + send ----
+// ---- improved cacheGroupId with debug logs and fuzzy matching ----
+function normalizeName(s) {
+  if (!s) return ''
+  // remove surrounding quotes, extra spaces, lowercase
+  return String(s).replace(/^[\s"'`]+|[\s"'`]+$/g, '').trim().toLowerCase()
+}
+function stripNonAlnum(s){
+  return String(s || '').toLowerCase().replace(/[^a-z0-9а-яё]+/gi,'').trim()
+}
+
 async function cacheGroupId(sendWelcome=false) {
   try {
     if (!sock || waConnectionStatus !== 'connected') { warnLog('WA not connected for group caching'); return }
     const groups = await sock.groupFetchAllParticipating()
     const list = Object.values(groups || {})
-    if (!list.length) { warnLog('⚠️ Нет участников групп'); cachedGroupJid = null; return }
+    infoLog(`🔎 Найдено ${list.length} групп(ы)`)
+
+    // build candidates array for logs
+    const candidates = list.map(g => {
+      return { id: g.id, name: g.subject || '' }
+    })
+    infoLog('📋 Доступные группы: ' + candidates.map(c => `${c.name}|${c.id}`).join(', '))
+
+    // who we will search for
+    const cfgId = WA_GROUP_ID ? (String(WA_GROUP_ID).endsWith('@g.us') ? WA_GROUP_ID : String(WA_GROUP_ID) + '@g.us') : null
+    const cfgNameRaw = WA_GROUP_NAME || WA_GROUP_ID || null
+    const cfgName = normalizeName(cfgNameRaw)
+    infoLog(`🔍 Ищу target by id=${cfgId} name="${cfgNameRaw}" (normalized="${cfgName}")`)
+
+    // try by id exact
     let target = null
-    if (WA_GROUP_ID) {
-      const normalized = WA_GROUP_ID.endsWith('@g.us') ? WA_GROUP_ID : (WA_GROUP_ID + '@g.us')
-      target = list.find(g => g.id === normalized)
+    if (cfgId) {
+      target = list.find(g => g.id === cfgId)
+      if (target) {
+        infoLog('✅ Найдено по JID: ' + cfgId)
+      }
     }
-    if (!target && WA_GROUP_NAME) target = list.find(g => (g.subject||'').trim().toLowerCase() === WA_GROUP_NAME.trim().toLowerCase())
-    if (!target && list.length === 1) target = list[0]
+
+    // try exact name (normalized)
+    if (!target && cfgName) {
+      target = list.find(g => normalizeName(g.subject) === cfgName)
+      if (target) infoLog(`✅ Найдено по точному имени: "${target.subject}"`)
+    }
+
+    // try startsWith (name)
+    if (!target && cfgName) {
+      target = list.find(g => normalizeName((g.subject||'')).startsWith(cfgName))
+      if (target) infoLog(`✅ Найдено по startsWith: "${target.subject}"`)
+    }
+
+    // try contains (partial)
+    if (!target && cfgName) {
+      target = list.find(g => normalizeName((g.subject||'')).includes(cfgName))
+      if (target) infoLog(`✅ Найдено по contains: "${target.subject}"`)
+    }
+
+    // try normalized alnum compare (strip punctuation)
+    if (!target && cfgName) {
+      const wanted = stripNonAlnum(cfgName)
+      target = list.find(g => stripNonAlnum(g.subject) === wanted)
+      if (target) infoLog(`✅ Найдено по stripNonAlnum exact: "${target.subject}"`)
+    }
+
+    // fallback: if only one group present, pick it
+    if (!target && list.length === 1) {
+      target = list[0]
+      infoLog('ℹ️ Выбрана единственная доступная группа: ' + (target.subject||'') + ' ('+target.id+')')
+    }
+
     if (target) {
       cachedGroupJid = target.id
-      infoLog('✅ Найдена WA группа: ' + (target.subject || '') + ' (' + target.id + ')')
+      infoLog('✅ Закэширован target group: ' + (target.subject || '') + ' (' + target.id + ')')
       if (sendWelcome) {
         try { await sendToWhatsApp('[🔧 сервисное сообщение]\n[🌎 подключено]') } catch(e){ warnLog('⚠️ Не удалось отправить welcome: ' + (e?.message||e)) }
       }
     } else {
       cachedGroupJid = null
-      warnLog('⚠️ Целевая группа не найдена; доступные: ' + list.map(g => `${g.subject}|${g.id}`).join(', '))
+      warnLog('⚠️ Целевая группа не найдена; доступные: ' + candidates.map(g => `${g.name}|${g.id}`).join(', '))
+      // leave cachedGroupJid null; operator can inspect /wa/groups
     }
   } catch (e) {
     errorLog('❌ Ошибка cacheGroupId: ' + (e?.message || e))
   }
 }
 
+// ---- send ----
 async function sendToWhatsApp(text) {
   try {
     if (!sock || waConnectionStatus !== 'connected') { warnLog('⏳ WA не готов — сообщение не отправлено'); return false }
@@ -347,7 +392,7 @@ async function sendToWhatsApp(text) {
   }
 }
 
-// ---- HTTP + Web UI ----
+// ---- HTTP + UI (same as before) ----
 const app = express()
 app.use(express.json())
 
@@ -370,7 +415,9 @@ app.get('/wa/status', (req, res) => {
   res.send({
     whatsapp: waConnectionStatus,
     qrPending: !!lastQR,
-    waGroup: cachedGroupJid ? { id: cachedGroupJid } : null
+    waGroup: cachedGroupJid ? { id: cachedGroupJid } : null,
+    configuredGroupId: WA_GROUP_ID || null,
+    configuredGroupName: WA_GROUP_NAME || null
   })
 })
 
@@ -400,7 +447,6 @@ app.post('/wa/relogin', async (req, res) => {
 
 app.get('/wa/relogin-ui', (req, res) => {
   const token = ADMIN_TOKEN
-  // fire and forget
   axios.post(`${UI_DOMAIN}/wa/relogin?token=${token}`).catch(()=>{})
   res.send(`<html><body><p>Relogin requested. Return to <a href="/">main</a>.</p></body></html>`)
 })
@@ -508,6 +554,7 @@ app.get('/', (req, res) => {
 // ---- startup ----
 ;(async () => {
   try {
+    infoLog(`🔧 Конфигурация: WA_GROUP_ID=${WA_GROUP_ID || ''} WA_GROUP_NAME=${WA_GROUP_NAME || ''}`)
     await startTelegram()
     await startWhatsApp({ reset: false })
     app.listen(Number(PORT), () => {
