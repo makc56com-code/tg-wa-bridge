@@ -3,3 +3,4 @@ node_modules/
 session.json
 auth/
 auth_info/
+index.old/
