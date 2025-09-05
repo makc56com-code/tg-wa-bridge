@@ -25,10 +25,8 @@ const {
   TELEGRAM_API_HASH,
   TELEGRAM_STRING_SESSION,
   TG_SOURCE,
-  // primary names (legacy)
   WA_GROUP_ID,
   WA_GROUP_NAME,
-  // fallback names (user requested)
   WHATSAPP_GROUP_ID,
   WHATSAPP_GROUP_NAME,
   PORT = 3000,
@@ -38,9 +36,7 @@ const {
   ADMIN_TOKEN = 'admin-token'
 } = process.env
 
-// prefer explicit WA_GROUP_ID then WHATSAPP_GROUP_ID
 const CONFIG_GROUP_ID = (WA_GROUP_ID && WA_GROUP_ID.trim()) ? WA_GROUP_ID.trim() : (WHATSAPP_GROUP_ID && WHATSAPP_GROUP_ID.trim() ? WHATSAPP_GROUP_ID.trim() : null)
-// prefer WA_GROUP_NAME then WHATSAPP_GROUP_NAME
 const CONFIG_GROUP_NAME = (WA_GROUP_NAME && WA_GROUP_NAME.trim()) ? WA_GROUP_NAME.trim() : (WHATSAPP_GROUP_NAME && WHATSAPP_GROUP_NAME.trim() ? WHATSAPP_GROUP_NAME.trim() : null)
 
 // ---- ensure temp dirs ----
@@ -67,6 +63,7 @@ let restartTimer = null
 let restartCount = 0
 let cachedGroupJid = null
 let lastConflictAt = 0
+let conflictCount = 0
 
 const PLOGGER = P({ level: 'warn' })
 const UI_DOMAIN = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`
@@ -178,7 +175,6 @@ async function onTelegramMessage(event) {
 
 // ---- WhatsApp ----
 function scheduleRestart({ reset = false } = {}) {
-  // if recent conflict, postpone
   const now = Date.now()
   if (now - lastConflictAt < 15_000 && !reset) {
     infoLog('ℹ️ Недавний conflict — отложим рестарт на 15s')
@@ -189,7 +185,7 @@ function scheduleRestart({ reset = false } = {}) {
 
   if (restartTimer) return
   restartCount = Math.min(restartCount + 1, 8)
-  const delay = Math.min(120000, Math.pow(2, restartCount) * 1000) // cap 2 minutes
+  const delay = Math.min(120000, Math.pow(2, restartCount) * 1000)
   infoLog(`ℹ️ Планируем рестарт WA через ${Math.round(delay/1000)}s (reset=${reset}, retryCount=${restartCount})`)
   restartTimer = setTimeout(() => {
     restartTimer = null
@@ -274,6 +270,7 @@ async function startWhatsApp({ reset = false } = {}) {
       if (connection === 'open') {
         waConnectionStatus = 'connected'
         restartCount = 0
+        conflictCount = 0 // сбрасываем счётчик конфликтов
         infoLog('✅ WhatsApp подключён')
         try { await saveCreds() } catch (e) {}
         debounceSaveAuthToGist(AUTH_DIR)
@@ -291,10 +288,17 @@ async function startWhatsApp({ reset = false } = {}) {
         try { await sock?.end?.() } catch (e) {}
 
         if (code === 440) {
-          // conflict/stream error -> set lastConflictAt to avoid restart storm
           lastConflictAt = Date.now()
-          warnLog('⚠️ Stream conflict (440). Не форсируем немедленный reset — даём cooldown.')
-          scheduleRestart({ reset: false })
+          conflictCount = (conflictCount || 0) + 1
+          warnLog('⚠️ Stream conflict (440). conflictCount=' + conflictCount)
+          if (conflictCount >= 3) {
+            warnLog('❌ Conflict повторился 3 раза — считаем, что сессия заменена. Запрашиваем новый QR (reset=true)')
+            // force fresh auth flow
+            scheduleRestart({ reset: true })
+          } else {
+            // give cooldown and try soft restart (no reset)
+            scheduleRestart({ reset: false })
+          }
         } else if ([401, 428].includes(code)) {
           warnLog('❌ Сессия недействительна — запустим flow с новой авторизацией (QR)')
           scheduleRestart({ reset: true })
@@ -343,14 +347,12 @@ async function cacheGroupId(sendWelcome=false) {
     })
     infoLog('📋 Доступные группы: ' + candidates.map(c => `${c.name}|${c.id}`).join(', '))
 
-    // who we will search for
     const cfgIdRaw = CONFIG_GROUP_ID || null
     const cfgId = cfgIdRaw ? (String(cfgIdRaw).endsWith('@g.us') ? cfgIdRaw : String(cfgIdRaw) + '@g.us') : null
     const cfgNameRaw = CONFIG_GROUP_NAME || null
     const cfgName = normalizeName(cfgNameRaw)
     infoLog(`🔍 Ищу target by id=${cfgId} name="${cfgNameRaw}" (normalized="${cfgName}")`)
 
-    // try by id exact
     let target = null
     if (cfgId) {
       target = list.find(g => g.id === cfgId)
@@ -359,32 +361,27 @@ async function cacheGroupId(sendWelcome=false) {
       }
     }
 
-    // try exact name (normalized)
     if (!target && cfgName) {
       target = list.find(g => normalizeName(g.subject) === cfgName)
       if (target) infoLog(`✅ Найдено по точному имени: "${target.subject}"`)
     }
 
-    // try startsWith (name)
     if (!target && cfgName) {
       target = list.find(g => normalizeName((g.subject||'')).startsWith(cfgName))
       if (target) infoLog(`✅ Найдено по startsWith: "${target.subject}"`)
     }
 
-    // try contains (partial)
     if (!target && cfgName) {
       target = list.find(g => normalizeName((g.subject||'')).includes(cfgName))
       if (target) infoLog(`✅ Найдено по contains: "${target.subject}"`)
     }
 
-    // try normalized alnum compare (strip punctuation)
     if (!target && cfgName) {
       const wanted = stripNonAlnum(cfgName)
       target = list.find(g => stripNonAlnum(g.subject) === wanted)
       if (target) infoLog(`✅ Найдено по stripNonAlnum exact: "${target.subject}"`)
     }
 
-    // fallback: if only one group present, pick it
     if (!target && list.length === 1) {
       target = list[0]
       infoLog('ℹ️ Выбрана единственная доступная группа: ' + (target.subject||'') + ' ('+target.id+')')
@@ -447,6 +444,14 @@ app.get('/wa/status', (req, res) => {
     configuredGroupId: CONFIG_GROUP_ID || null,
     configuredGroupName: CONFIG_GROUP_NAME || null
   })
+})
+
+app.get('/wa/auth-status', (req, res) => {
+  try {
+    if (!fs.existsSync(AUTH_DIR)) return res.send({ exists: false, files: [] })
+    const files = fs.readdirSync(AUTH_DIR).filter(f => fs.statSync(path.join(AUTH_DIR, f)).isFile())
+    res.send({ exists: true, files })
+  } catch (e) { res.status(500).send({ error: e?.message || e }) }
 })
 
 app.post('/wa/reset', async (req, res) => {
@@ -587,7 +592,7 @@ app.get('/', (req, res) => {
     await startWhatsApp({ reset: false })
     app.listen(Number(PORT), () => {
       infoLog(`🌐 HTTP доступен: ${UI_DOMAIN} (port ${PORT})`)
-      appendLogLine('Available endpoints: /, /ping, /healthz, /tg/status, /tg/send, /wa/status, /wa/groups, /wa/send, /wa/qr, /wa/qr-img, /wa/qr-ascii, /wa/reset, /wa/relogin, /logs')
+      appendLogLine('Available endpoints: /, /ping, /healthz, /tg/status, /tg/send, /wa/status, /wa/groups, /wa/send, /wa/qr, /wa/qr-img, /wa/qr-ascii, /wa/reset, /wa/relogin, /wa/auth-status, /logs')
     })
   } catch (e) {
     errorLog('❌ Ошибка старта: ' + (e?.message || e))
