@@ -1,3 +1,0 @@
-Remove-Item -Recurse -Force .\.wwebjs_auth\session\Default
-
-rd /s /q .\.wwebjs_auth
