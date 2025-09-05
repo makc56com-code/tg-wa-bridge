@@ -71,7 +71,7 @@ async function loadAuthFromGist() {
       headers: { Authorization: `token ${GITHUB_TOKEN}` }
     })
     const files = res.data.files
-    if (!files) return false
+    if (!files || Object.keys(files).length === 0) return false
 
     if (!fs.existsSync('./auth_info_baileys')) {
       fs.mkdirSync('./auth_info_baileys')
@@ -94,9 +94,9 @@ function debounceSaveAuth() {
 
 async function saveAuthToGist() {
   try {
-    const files = {}
     if (!fs.existsSync('./auth_info_baileys')) return
 
+    const files = {}
     const authFiles = fs.readdirSync('./auth_info_baileys')
     for (const file of authFiles) {
       files[file] = { content: fs.readFileSync(`./auth_info_baileys/${file}`, 'utf-8') }
@@ -118,12 +118,17 @@ async function startWhatsApp({ reset = false } = {}) {
 
   console.log(chalk.green('🚀 Запуск WhatsApp...'))
 
+  // Очистка локальной папки при ручном сбросе
   if (reset && fs.existsSync('./auth_info_baileys')) {
     fs.rmSync('./auth_info_baileys', { recursive: true, force: true })
   }
 
+  // Ждём загрузки сессии из Gist
   const loaded = await loadAuthFromGist()
-  if (!loaded) console.log('⚠️ Сессия не найдена, будет нужна авторизация через QR')
+  if (!loaded) {
+    console.log('⚠️ Сессия не найдена в Gist, будет нужна авторизация через QR')
+    if (!fs.existsSync('./auth_info_baileys')) fs.mkdirSync('./auth_info_baileys')
+  }
 
   const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys')
   const { version } = await fetchLatestBaileysVersion()
@@ -153,10 +158,6 @@ async function startWhatsApp({ reset = false } = {}) {
       console.log(chalk.green('✅ WhatsApp подключен'))
       sendWelcome()
       lastQR = null
-      // очистка локальной папки после старта
-      if (fs.existsSync('./auth_info_baileys')) {
-        fs.rmSync('./auth_info_baileys', { recursive: true, force: true })
-      }
       isStartingWA = false
     }
     if (connection === 'close') {
@@ -166,13 +167,14 @@ async function startWhatsApp({ reset = false } = {}) {
       if (statusCode === 401) {
         console.log('❌ Сессия недействительна, нужна новая авторизация через QR')
         startWhatsApp({ reset: true })
-      } else if (statusCode !== 409) { // 409 = conflict
+      } else if (statusCode !== 409) {
         setTimeout(() => startWhatsApp({ reset: false }), 5000)
       }
     }
   })
 }
 
+// ---------------- Отправка сообщений ----------------
 async function sendToWhatsApp(text) {
   if (!sock || !sock.user) {
     console.log(chalk.red('❌ Нет подключения к WhatsApp'))
@@ -260,18 +262,14 @@ app.get('/qr', async (req, res) => {
 // ---------------- Graceful shutdown ----------------
 process.on('SIGINT', async () => {
   console.log('👋 Завершаем...')
-  try {
-    await sock?.end?.()
-    await tgClient?.disconnect?.()
-  } catch {}
+  try { await sock?.end?.(); await tgClient?.disconnect?.() } catch {}
+  if (fs.existsSync('./auth_info_baileys')) fs.rmSync('./auth_info_baileys', { recursive: true, force: true })
   process.exit(0)
 })
 
 process.on('SIGTERM', async () => {
   console.log('👋 Завершаем...')
-  try {
-    await sock?.end?.()
-    await tgClient?.disconnect?.()
-  } catch {}
+  try { await sock?.end?.(); await tgClient?.disconnect?.() } catch {}
+  if (fs.existsSync('./auth_info_baileys')) fs.rmSync('./auth_info_baileys', { recursive: true, force: true })
   process.exit(0)
 })
