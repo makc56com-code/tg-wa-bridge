@@ -1,9 +1,7 @@
-// index.js (полностью обновлённый — UI улучшен, кнопки логируют действия, форматирование сообщений)
-// Примечание: я изменил только HTML/JS интерфейс и добавил видимую логику для всех кнопок,
-// а также немного доработал поведение клиента на стороне браузера (формат сообщений, отображение логов).
-// Серверная логика осталась прежней — я не удалял твоих обработчиков маршрутов, просто расширил UI.
-// Внимание: на страницу внедряется ADMIN_TOKEN (для кнопок relogin/reset) — это нужно для удобства управления.
-// Если тебе это не нравится по соображениям безопасности — скажи, уберу и оставлю только relogin-ui.
+// index.js (полностью обновлённый — UI и логика Radar включены)
+// Я внёс минимальные изменения в остальную логику: добавил флаг radarActive, эндпоинты для включения/выключения радара,
+// UI-кнопки и поправил CSS для "Краткий статус", чтобы ничего не вылазило за границы.
+// Всё остальное — оригинальный код с небольшими адаптациями (отправка welcome только если radarActive).
 import 'dotenv/config'
 import express from 'express'
 import makeWASocket, {
@@ -131,6 +129,9 @@ let restartCount = 0
 let cachedGroupJid = null
 let lastConflictAt = 0
 let conflictCount = 0
+
+// RADAR: по умолчанию активируем, чтобы поведение осталось как раньше (можешь выключить через UI)
+let radarActive = true
 
 const PLOGGER = P({ level: LOG_LEVEL || 'error' })
 const UI_DOMAIN = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`
@@ -334,7 +335,7 @@ async function startWhatsApp({ reset = false } = {}) {
         infoLog('✅ WhatsApp подключён')
         try { await saveCreds() } catch (e) {}
         debounceSaveAuthToGist(AUTH_DIR)
-        try { await cacheGroupId(true) } catch (e) { warnLog('⚠️ cacheGroupId failed: ' + (e?.message || e)) }
+        try { await cacheGroupId(radarActive) } catch (e) { warnLog('⚠️ cacheGroupId failed: ' + (e?.message || e)) }
         lastQR = null
         isStartingWA = false
       }
@@ -506,7 +507,8 @@ app.get('/wa/status', (req, res) => {
     qrPending: !!lastQR,
     waGroup: cachedGroupJid ? { id: cachedGroupJid } : null,
     configuredGroupId: CONFIG_GROUP_ID || null,
-    configuredGroupName: CONFIG_GROUP_NAME || null
+    configuredGroupName: CONFIG_GROUP_NAME || null,
+    radarActive: !!radarActive
   })
 })
 
@@ -594,6 +596,43 @@ app.get('/wa/groups', async (req, res) => {
   } catch (e) { res.status(500).send({ error: e?.message || e }) }
 })
 
+// RADAR endpoints
+app.post('/wa/radar/on', async (req, res) => {
+  const token = req.query.token || req.body.token
+  if (ADMIN_TOKEN && token !== ADMIN_TOKEN) return res.status(403).send({ error: 'forbidden' })
+  try {
+    radarActive = true
+    infoLog('🔔 Radar turned ON via API')
+    // try to ensure WA is running
+    try { startWhatsApp({ reset: false }).catch(()=>{}) } catch(e){}
+    // if connected — send the radar-on message, otherwise the cacheGroupId on connect will send it
+    if (waConnectionStatus === 'connected') {
+      await sendToWhatsApp('[🔧service🔧]\n[🌎подключено🌎]\n[🚨РАДАР АКТИВЕН🚨]')
+    }
+    res.send({ status: 'ok', radarActive })
+  } catch (e) { res.status(500).send({ error: e?.message || e }) }
+})
+
+app.post('/wa/radar/off', async (req, res) => {
+  const token = req.query.token || req.body.token
+  if (ADMIN_TOKEN && token !== ADMIN_TOKEN) return res.status(403).send({ error: 'forbidden' })
+  try {
+    radarActive = false
+    infoLog('🔕 Radar turned OFF via API')
+    // send radar-off message if possible
+    if (waConnectionStatus === 'connected') {
+      await sendToWhatsApp('[🔧service🔧]\n[🚨РАДАР отключен🚨]\n[🤚ручной режим🤚]')
+    } else {
+      warnLog('WA not connected — radar-off message not sent to group (will send when connected only if specified).')
+    }
+    res.send({ status: 'ok', radarActive })
+  } catch (e) { res.status(500).send({ error: e?.message || e }) }
+})
+
+app.get('/wa/radar/status', (req, res) => {
+  res.send({ radarActive: !!radarActive })
+})
+
 // recent forwarded messages (for monitoring)
 app.get('/wa/recent-forwarded', (req, res) => {
   res.send(recentForwarded.slice().reverse())
@@ -635,7 +674,6 @@ app.get('/', (req, res) => {
     header{display:flex;justify-content:space-between;align-items:center;gap:12px}
     .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
     .btn{display:inline-flex;align-items:center;justify-content:center;margin:6px;padding:10px 14px;border-radius:10px;text-decoration:none;background:var(--accent);color:#04202a;font-weight:700;cursor:pointer;border:none}
-    /* теперь ghost тоже выглядит как обычная кнопка (по просьбе) */
     .ghost{display:inline-flex;align-items:center;justify-content:center;margin:6px;padding:10px 14px;border-radius:10px;text-decoration:none;background:var(--accent);color:#04202a;font-weight:700;cursor:pointer;border:none}
     .qr{margin-top:12px}
     .statusline{margin-top:12px;color:var(--muted)}
@@ -648,6 +686,16 @@ app.get('/', (req, res) => {
     .log{white-space:pre-wrap;font-family:monospace;font-size:12px;color:#cfeefb;max-height:420px;overflow:auto;padding:8px;background:rgba(0,0,0,0.08);border-radius:6px}
     .full-logs{margin-top:12px}
     .mutedbox{color:var(--muted);font-size:13px}
+
+    /* CORRECTION: prevent statustxt overflow */
+    #statustxt { max-height:140px; overflow:auto; word-break:break-word; white-space:pre-wrap; color:var(--muted); font-size:13px; margin-top:6px; border-radius:6px; padding:6px; background:rgba(0,0,0,0.04); }
+
+    /* simple toggle style */
+    .toggle-wrap{display:flex;align-items:center;gap:10px;margin-top:8px}
+    .switch{position:relative;width:56px;height:30px;border-radius:20px;background:rgba(255,255,255,0.06);cursor:pointer;display:inline-block}
+    .switch .knob{position:absolute;top:3px;left:3px;width:24px;height:24px;border-radius:50%;background:#fff;transition:left .18s ease}
+    .switch.on{background:linear-gradient(90deg,#06b6d4,#0ea5a4)}
+    .switch.on .knob{left:29px}
     @media(max-width:900px){ .panel{grid-template-columns:1fr} .btn{flex:1 1 auto} .ghost{flex:1 1 auto} }
   </style>
   </head><body><div class="card">
@@ -701,7 +749,22 @@ app.get('/', (req, res) => {
       <hr style="margin:10px 0;border:none;border-top:1px solid rgba(255,255,255,0.03)">
 
       <div><strong>Краткий статус</strong>
-        <div class="small" id="statustxt">...</div>
+        <div id="statustxt">...</div>
+
+        <!-- Radar toggle -->
+        <div class="toggle-wrap">
+          <div id="radarSwitch" class="switch" title="Toggle Radar"></div>
+          <div>
+            <div style="font-weight:700" id="radarLabel">RADAR</div>
+            <div class="small" id="radarSub">загрузка...</div>
+          </div>
+        </div>
+
+        <div style="display:flex;gap:8px;margin-top:8px">
+          <button class="btn" id="radarOnBtn">Radar ON</button>
+          <button class="ghost" id="radarOffBtn">Radar OFF</button>
+        </div>
+
       </div>
     </div>
   </div>
@@ -778,6 +841,8 @@ app.get('/', (req, res) => {
         // обновим краткий статус
         document.getElementById('wastate').innerText = r.data.whatsapp
         document.getElementById('statustxt').innerText = JSON.stringify(r.data)
+        // radar flag
+        setRadarUi(!!r.data.radarActive)
       } catch (e) { appendToLogBox('! wa status error: ' + e.message) }
     }
 
@@ -873,6 +938,54 @@ app.get('/', (req, res) => {
       await loadStatus(true)
     }
 
+    // RADAR UI handlers
+    const radarSwitch = document.getElementById('radarSwitch')
+    const radarLabel = document.getElementById('radarLabel')
+    const radarSub = document.getElementById('radarSub')
+    const radarOnBtn = document.getElementById('radarOnBtn')
+    const radarOffBtn = document.getElementById('radarOffBtn')
+
+    function setRadarUi(isOn) {
+      if (isOn) {
+        radarSwitch.classList.add('on')
+        radarLabel.innerText = 'RADAR — ON'
+        radarSub.innerText = 'Автоматическая отправка активна'
+        appendToLogBox('ℹ️ Radar UI: ON')
+      } else {
+        radarSwitch.classList.remove('on')
+        radarLabel.innerText = 'RADAR — OFF'
+        radarSub.innerText = 'Ручной режим'
+        appendToLogBox('ℹ️ Radar UI: OFF')
+      }
+    }
+
+    radarSwitch.onclick = async () => {
+      // toggle
+      const currentlyOn = radarSwitch.classList.contains('on')
+      if (currentlyOn) {
+        await toggleRadar(false)
+      } else {
+        await toggleRadar(true)
+      }
+    }
+
+    radarOnBtn.onclick = async () => { await toggleRadar(true) }
+    radarOffBtn.onclick = async () => { await toggleRadar(false) }
+
+    async function toggleRadar(on) {
+      appendToLogBox('-> toggle radar -> ' + (on ? 'ON' : 'OFF'))
+      try {
+        const url = on ? '/wa/radar/on' : '/wa/radar/off'
+        const r = await callApi(url + '?token=' + encodeURIComponent(ADMIN_TOKEN), { method: 'POST' })
+        if (!r.ok) {
+          appendToLogBox('<- radar toggle error: HTTP ' + r.status + ' ' + JSON.stringify(r.data))
+        } else {
+          appendToLogBox('<- radar toggled: ' + JSON.stringify(r.data))
+          setRadarUi(!!(r.data && r.data.radarActive))
+        }
+      } catch (e) { appendToLogBox('! radar toggle error: ' + e.message) }
+    }
+
     async function loadStatus(forceLogs=false) {
       try {
         const s = await callApi('/wa/status')
@@ -887,7 +1000,9 @@ app.get('/', (req, res) => {
           img.src = '/wa/qr-img?ts=' + Date.now()
           appendToLogBox('QR pending — image refreshed')
         }
-        // всегда подтянем tail логов, если force или каждые загрузки
+        // update radar UI
+        setRadarUi(!!(s.data && s.data.radarActive))
+        // always pull logs if forced
         if (forceLogs) {
           try {
             const r = await fetch('/logs/tail?lines=120')
@@ -920,7 +1035,7 @@ app.get('/', (req, res) => {
     await startWhatsApp({ reset: false })
     app.listen(Number(PORT), () => {
       infoLog(`🌐 HTTP доступен: ${UI_DOMAIN} (port ${PORT})`)
-      appendLogLine('Available endpoints: /, /ping, /healthz, /tg/status, /tg/send, /wa/status, /wa/groups, /wa/send, /wa/qr, /wa/qr-img, /wa/qr-ascii, /wa/reset, /wa/relogin, /wa/auth-status, /wa/recent-forwarded, /wa/recent-messages, /logs, /logs/tail')
+      appendLogLine('Available endpoints: /, /ping, /healthz, /tg/status, /tg/send, /wa/status, /wa/groups, /wa/send, /wa/qr, /wa/qr-img, /wa/qr-ascii, /wa/reset, /wa/relogin, /wa/auth-status, /wa/recent-forwarded, /wa/recent-messages, /logs, /logs/tail, /wa/radar/on, /wa/radar/off, /wa/radar/status')
     })
   } catch (e) {
     errorLog('❌ Ошибка старта: ' + (e?.message || e))
