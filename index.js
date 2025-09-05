@@ -1,6 +1,5 @@
-// index.js (полностью обновлённый — исправлены проблемы с RADAR, убрана ненужная кнопка "Send → WA")
-// Примечание: я изменил только тот код, который касается UI и логики RADAR/сервисных сообщений,
-// а также добавил сохранение состояния RADAR в AUTH_DIR/radar_state.json и надёжную отправку сервисных сообщений.
+// index.js (полностью обновлённый — с фиксом RADAR и убранной кнопкой "Send → WA")
+// ПРИМЕЧАНИЕ: присылаю полный файл целиком, как ты просил — замени им текущий index.js
 import 'dotenv/config'
 import express from 'express'
 import makeWASocket, {
@@ -137,85 +136,32 @@ const MAX_CACHE = 200
 const recentForwarded = []     // {text, ts}
 const recentWAMessages = []    // {from, text, ts}
 
-// ---- service message constants ----
-const msgOn = '[🔧service🔧]\n[🌎подключено🌎]\n[🚨РАДАР АКТИВЕН🚨]'
-const msgOff = '[🔧service🔧]\n[🚨РАДАР отключен🚨]\n[🤚ручной режим🤚]'
-
-// ---- RADAR state persistence ----
+// ---- radar state persistence ----
 const RADAR_STATE_FILE = path.join(AUTH_DIR, 'radar_state.json')
 let radarEnabled = true // default
-let pendingServiceMessage = null
-let lastServiceSentAt = 0
-const SERVICE_COOLDOWN_MS = 1400
-
 function loadRadarState() {
   try {
-    if (!fs.existsSync(RADAR_STATE_FILE)) return true
+    if (!fs.existsSync(RADAR_STATE_FILE)) {
+      radarEnabled = true
+      saveRadarState().catch(()=>{})
+      return radarEnabled
+    }
     const raw = fs.readFileSync(RADAR_STATE_FILE, 'utf8')
-    const obj = JSON.parse(raw || '{}')
-    return !!obj.enabled
+    const json = JSON.parse(raw || '{}')
+    radarEnabled = !!json.enabled
   } catch (e) {
-    warnLog('⚠️ Не удалось загрузить radar_state: ' + (e?.message || e))
-    return true
+    warnLog('⚠️ Ошибка чтения radar state, defaulting to true: ' + (e?.message || e))
+    radarEnabled = true
   }
+  return radarEnabled
 }
-function saveRadarStateSync(enabled) {
+async function saveRadarState() {
   try {
-    fs.mkdirSync(path.dirname(RADAR_STATE_FILE), { recursive: true })
-    fs.writeFileSync(RADAR_STATE_FILE, JSON.stringify({ enabled: !!enabled }), 'utf8')
+    fs.mkdirSync(AUTH_DIR, { recursive: true })
+    fs.writeFileSync(RADAR_STATE_FILE, JSON.stringify({ enabled: !!radarEnabled }), 'utf8')
+    infoLog('💾 radar state saved: ' + (radarEnabled ? 'ON' : 'OFF'))
   } catch (e) {
-    warnLog('⚠️ Не удалось сохранить radar_state: ' + (e?.message || e))
-  }
-}
-function setRadarState(enabled, { sendMsg = true } = {}) {
-  radarEnabled = !!enabled
-  saveRadarStateSync(radarEnabled)
-  infoLog(`ℹ️ RADAR state set => ${radarEnabled ? 'ON' : 'OFF'}`)
-  if (sendMsg) sendRadarStateMessage()
-}
-
-// отправка сервисного сообщения (с debounce/защитой от дублей)
-// если WA не готов — ставим pendingServiceMessage, которая будет отправлена при наличии cachedGroupJid/connected
-async function sendRadarStateMessage() {
-  try {
-    const now = Date.now()
-    if (now - lastServiceSentAt < SERVICE_COOLDOWN_MS) {
-      infoLog('ℹ️ Отклонено дублирующее сервисное сообщение (cooldown)')
-      return
-    }
-    const msg = radarEnabled ? msgOn : msgOff
-    if (waConnectionStatus === 'connected' && (cachedGroupJid || CONFIG_GROUP_ID)) {
-      const ok = await sendToWhatsApp(msg)
-      if (ok) {
-        lastServiceSentAt = Date.now()
-        pendingServiceMessage = null
-      } else {
-        pendingServiceMessage = msg
-        warnLog('⚠️ Сервисное сообщение не отправлено — помечено как pending')
-      }
-    } else {
-      pendingServiceMessage = msg
-      warnLog('⚠️ WA не подключен — сервисное сообщение отложено (pending)')
-    }
-  } catch (e) {
-    warnLog('⚠️ Ошибка sendRadarStateMessage: ' + (e?.message || e))
-  }
-}
-async function flushPendingServiceIfAny() {
-  if (!pendingServiceMessage) return
-  try {
-    if (waConnectionStatus === 'connected' && (cachedGroupJid || CONFIG_GROUP_ID)) {
-      const ok = await sendToWhatsApp(pendingServiceMessage)
-      if (ok) {
-        lastServiceSentAt = Date.now()
-        pendingServiceMessage = null
-        infoLog('✅ Отправлено отложенное сервисное сообщение')
-      } else {
-        warnLog('⚠️ Отложенное сообщение ещё не отправлено — останется pending')
-      }
-    }
-  } catch (e) {
-    warnLog('⚠️ flushPendingServiceIfAny error: ' + (e?.message || e))
+    warnLog('⚠️ Не удалось сохранить radar state: ' + (e?.message || e))
   }
 }
 
@@ -313,7 +259,12 @@ async function onTelegramMessage(event) {
 
     if (isFromSource && text && String(text).trim()) {
       infoLog('✉️ Получено из TG: ' + String(text).slice(0,200))
-      await sendToWhatsApp(String(text))
+      // only forward text messages when radar is enabled
+      if (radarEnabled) {
+        await sendToWhatsApp(String(text))
+      } else {
+        infoLog('ℹ️ RADAR OFF — пропускаем пересылку в WA')
+      }
     } else {
       // логируем непризнанные сообщения для отладки
       if (text && String(text).trim()) {
@@ -416,8 +367,6 @@ async function startWhatsApp({ reset = false } = {}) {
         try { await cacheGroupId(true) } catch (e) { warnLog('⚠️ cacheGroupId failed: ' + (e?.message || e)) }
         lastQR = null
         isStartingWA = false
-        // если был отложенный сервис — попробуем отправить
-        await flushPendingServiceIfAny().catch(()=>{})
       }
 
       if (connection === 'close') {
@@ -533,10 +482,14 @@ async function cacheGroupId(sendWelcome=false) {
       cachedGroupJid = target.id
       infoLog('✅ Закэширован target group: ' + (target.subject || '') + ' (' + target.id + ')')
       if (sendWelcome) {
-        try { await sendRadarStateMessage() } catch(e){ warnLog('⚠️ Не удалось отправить welcome: ' + (e?.message||e)) }
-      } else {
-        // если есть отложенное сообщение — попробуем его
-        await flushPendingServiceIfAny().catch(()=>{})
+        try {
+          // при старте/деплое шлём сервисное сообщение отражающее текущий radarEnabled
+          if (radarEnabled) {
+            await sendToWhatsApp('[🔧service🔧]\n[🌎подключено🌎]\n[🚨РАДАР АКТИВЕН🚨]')
+          } else {
+            await sendToWhatsApp('[🔧service🔧]\n[🌎подключено🌎]\n[🚫РАДАР НЕ АКТИВЕН🚫]')
+          }
+        } catch(e){ warnLog('⚠️ Не удалось отправить welcome: ' + (e?.message||e)) }
       }
     } else {
       cachedGroupJid = null
@@ -569,6 +522,9 @@ const app = express()
 app.use(express.json())
 app.use(express.urlencoded({ extended: true }))
 
+// load persisted radar state early
+loadRadarState()
+
 app.get('/ping', (req, res) => res.send('pong'))
 app.get('/healthz', (req, res) => res.status(200).send('ok'))
 
@@ -590,9 +546,7 @@ app.get('/wa/status', (req, res) => {
     qrPending: !!lastQR,
     waGroup: cachedGroupJid ? { id: cachedGroupJid } : null,
     configuredGroupId: CONFIG_GROUP_ID || null,
-    configuredGroupName: CONFIG_GROUP_NAME || null,
-    radar: radarEnabled,
-    pendingServiceMessage: !!pendingServiceMessage
+    configuredGroupName: CONFIG_GROUP_NAME || null
   })
 })
 
@@ -689,23 +643,50 @@ app.get('/wa/recent-messages', (req, res) => {
   res.send(recentWAMessages.slice().reverse())
 })
 
-// Radar API
+// ---- Radar endpoints ----
 app.get('/radar/status', (req, res) => {
-  res.send({ radar: radarEnabled })
+  res.send({ enabled: !!radarEnabled })
 })
-app.post('/radar/set', async (req, res) => {
-  const state = (req.query.state || req.body.state || '').toString().toLowerCase()
-  if (!['on','off','true','false','1','0'].includes(state)) {
-    return res.status(400).send({ error: 'state must be on|off' })
-  }
-  const enabled = (state === 'on' || state === 'true' || state === '1')
+
+app.post('/radar/toggle', async (req, res) => {
+  const token = req.query.token || req.body.token
+  if (ADMIN_TOKEN && token !== ADMIN_TOKEN) return res.status(403).send({ error: 'forbidden' })
   try {
-    setRadarState(enabled, { sendMsg: true })
-    res.send({ status: 'ok', radar: radarEnabled })
+    radarEnabled = !radarEnabled
+    await saveRadarState()
+    // send service message reflecting new state
+    if (radarEnabled) {
+      await sendToWhatsApp('[🔧service🔧]\n[РАДАР ВКЛЮЧЕН]')
+    } else {
+      await sendToWhatsApp('[🔧service🔧]\n[РАДАР ВЫКЛЮЧЕН]')
+    }
+    res.send({ status: 'ok', enabled: radarEnabled })
   } catch (e) { res.status(500).send({ error: e?.message || e }) }
 })
 
-// logs endpoints
+app.post('/radar/on', async (req, res) => {
+  const token = req.query.token || req.body.token
+  if (ADMIN_TOKEN && token !== ADMIN_TOKEN) return res.status(403).send({ error: 'forbidden' })
+  try {
+    radarEnabled = true
+    await saveRadarState()
+    await sendToWhatsApp('[🔧service🔧]\n[РАДАР ВКЛЮЧЕН]')
+    res.send({ status: 'ok', enabled: radarEnabled })
+  } catch (e) { res.status(500).send({ error: e?.message || e }) }
+})
+
+app.post('/radar/off', async (req, res) => {
+  const token = req.query.token || req.body.token
+  if (ADMIN_TOKEN && token !== ADMIN_TOKEN) return res.status(403).send({ error: 'forbidden' })
+  try {
+    radarEnabled = false
+    await saveRadarState()
+    await sendToWhatsApp('[🔧service🔧]\n[РАДАР ВЫКЛЮЧЕН]')
+    res.send({ status: 'ok', enabled: radarEnabled })
+  } catch (e) { res.status(500).send({ error: e?.message || e }) }
+})
+
+// ---- logs endpoints ----
 app.get('/logs', (req, res) => {
   try {
     const content = fs.existsSync(LOG_FILE) ? fs.readFileSync(LOG_FILE, 'utf8') : ''
@@ -726,10 +707,9 @@ app.get('/logs/tail', (req, res) => {
   } catch (e) { res.status(500).send(e?.message || e) }
 })
 
-// main UI — улучшенная панель: логи занимают нижнюю полосу, кнопки дают вывод в лог
+// main UI — улучшенная панель: убрана лишняя кнопка "Send → WA", добавлены RADAR кнопки
 app.get('/', (req, res) => {
   const qrPending = !!lastQR
-  const initialRadar = radarEnabled ? 'ON' : 'OFF'
   const html = `<!doctype html><html><head><meta charset="utf-8"/><title>TG→WA Bridge</title>
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <style>
@@ -765,8 +745,12 @@ app.get('/', (req, res) => {
     <button class="btn" id="tgstatus">TG Status</button>
     <button class="btn" id="wastatus">WA Status</button>
     <button class="btn" id="wagroups">WA Groups</button>
+    <!-- removed unnecessary "Send → WA" button per request -->
     <button class="btn" id="resetwa">Reset WA</button>
     <button class="btn" id="reloginwa">Relogin WA</button>
+    <button class="btn" id="radar_toggle">RADAR — ...</button>
+    <button class="ghost" id="radar_on_btn">Radar ON</button>
+    <button class="ghost" id="radar_off_btn">Radar OFF</button>
     <button class="ghost" id="qrascii">QR ASCII</button>
     <button class="ghost" id="logsbtn">Logs</button>
   </div>
@@ -805,17 +789,6 @@ app.get('/', (req, res) => {
       <div><strong>Краткий статус</strong>
         <div class="small" id="statustxt">...</div>
       </div>
-
-      <hr style="margin:10px 0;border:none;border-top:1px solid rgba(255,255,255,0.03)">
-
-      <div><strong>RADAR</strong>
-        <div style="display:flex;gap:8px;margin-top:8px">
-          <button class="btn" id="radar_toggle">RADAR — ${initialRadar}</button>
-          <button class="ghost" id="radar_on_btn">Radar ON</button>
-          <button class="ghost" id="radar_off_btn">Radar OFF</button>
-        </div>
-        <div class="small" id="radar_hint">Состояние RADAR: <span id="radar_state">${initialRadar}</span></div>
-      </div>
     </div>
   </div>
 
@@ -829,6 +802,7 @@ app.get('/', (req, res) => {
   </div>
 
   <script>
+    // Вставляем ADMIN_TOKEN в клиент (если хочешь убрать — скажи)
     const ADMIN_TOKEN = ${JSON.stringify(ADMIN_TOKEN || '')};
 
     function fmtNow() {
@@ -839,6 +813,7 @@ app.get('/', (req, res) => {
         const box = document.getElementById('logbox')
         const ts = '[' + fmtNow() + '] '
         box.innerText = ts + s + '\\n\\n' + box.innerText
+        // trim to avoid бесконечный рост в UI
         if (box.innerText.length > 20000) box.innerText = box.innerText.slice(0, 20000)
       } catch(e){}
       document.getElementById('lastupd').innerText = fmtNow()
@@ -879,19 +854,16 @@ app.get('/', (req, res) => {
       try {
         const r = await callApi('/wa/status')
         appendToLogBox('<- wa status: ' + JSON.stringify(r.data))
+        // если есть qrPending — покажем QR картинку
         if (r.data && r.data.qrPending) {
           const box = document.getElementById('qrbox')
           let img = box.querySelector('img')
           if(!img){ img = document.createElement('img'); img.style.maxWidth='320px'; box.innerHTML=''; box.appendChild(img) }
           img.src = '/wa/qr-img?ts=' + Date.now()
         }
+        // обновим краткий статус
         document.getElementById('wastate').innerText = r.data.whatsapp
         document.getElementById('statustxt').innerText = JSON.stringify(r.data)
-        // sync radar state
-        if (r.data && typeof r.data.radar !== 'undefined') {
-          document.getElementById('radar_state').innerText = r.data.radar ? 'ON' : 'OFF'
-          document.getElementById('radar_toggle').innerText = 'RADAR — ' + (r.data.radar ? 'ON' : 'OFF')
-        }
       } catch (e) { appendToLogBox('! wa status error: ' + e.message) }
     }
 
@@ -917,6 +889,7 @@ app.get('/', (req, res) => {
       if (!confirm('Релогин WA (новая авторизация — QR) — продолжить?')) return
       appendToLogBox('-> relogin WA requested')
       try {
+        // используем удобный UI маршрут, он вызывает внутренний POST с токеном
         const r = await callApi('/wa/relogin-ui')
         appendToLogBox('<- relogin-ui: ' + (r.ok ? JSON.stringify(r.data) : 'HTTP ' + r.status))
       } catch (e) { appendToLogBox('! relogin error: ' + e.message) }
@@ -924,6 +897,7 @@ app.get('/', (req, res) => {
 
     document.getElementById('qrascii').onclick = async () => {
       appendToLogBox('-> open QR ASCII')
+      // откроем в текущем окне (как раньше), но также покажем в лог
       window.open('/wa/qr-ascii', '_blank')
       appendToLogBox('<- QR ASCII opened in new tab')
     }
@@ -979,41 +953,29 @@ app.get('/', (req, res) => {
       await loadStatus(true)
     }
 
-    // RADAR controls
+    // RADAR buttons
     document.getElementById('radar_toggle').onclick = async () => {
       appendToLogBox('-> toggle radar requested')
       try {
-        // получим текущее, инвертируем
-        const cur = await callApi('/radar/status')
-        const target = !(cur.data && cur.data.radar)
-        const r = await callApi('/radar/set?state=' + (target ? 'on' : 'off'), { method: 'POST' })
-        appendToLogBox('<- radar toggle result: ' + (r.ok ? JSON.stringify(r.data) : 'HTTP ' + r.status + ' ' + JSON.stringify(r.data)))
-        if (r.ok) {
-          document.getElementById('radar_state').innerText = r.data.radar ? 'ON' : 'OFF'
-          document.getElementById('radar_toggle').innerText = 'RADAR — ' + (r.data.radar ? 'ON' : 'OFF')
-        }
+        const r = await callApi('/radar/toggle?token=' + encodeURIComponent(ADMIN_TOKEN), { method: 'POST' })
+        appendToLogBox('<- radar toggle: ' + (r.ok ? JSON.stringify(r.data) : 'HTTP ' + r.status + ' ' + JSON.stringify(r.data)))
+        await loadStatus(true)
       } catch (e) { appendToLogBox('! radar toggle error: ' + e.message) }
     }
     document.getElementById('radar_on_btn').onclick = async () => {
       appendToLogBox('-> radar ON requested')
       try {
-        const r = await callApi('/radar/set?state=on', { method: 'POST' })
+        const r = await callApi('/radar/on?token=' + encodeURIComponent(ADMIN_TOKEN), { method: 'POST' })
         appendToLogBox('<- radar on: ' + (r.ok ? JSON.stringify(r.data) : 'HTTP ' + r.status + ' ' + JSON.stringify(r.data)))
-        if (r.ok) {
-          document.getElementById('radar_state').innerText = r.data.radar ? 'ON' : 'OFF'
-          document.getElementById('radar_toggle').innerText = 'RADAR — ' + (r.data.radar ? 'ON' : 'OFF')
-        }
+        await loadStatus(true)
       } catch (e) { appendToLogBox('! radar on error: ' + e.message) }
     }
     document.getElementById('radar_off_btn').onclick = async () => {
       appendToLogBox('-> radar OFF requested')
       try {
-        const r = await callApi('/radar/set?state=off', { method: 'POST' })
+        const r = await callApi('/radar/off?token=' + encodeURIComponent(ADMIN_TOKEN), { method: 'POST' })
         appendToLogBox('<- radar off: ' + (r.ok ? JSON.stringify(r.data) : 'HTTP ' + r.status + ' ' + JSON.stringify(r.data)))
-        if (r.ok) {
-          document.getElementById('radar_state').innerText = r.data.radar ? 'ON' : 'OFF'
-          document.getElementById('radar_toggle').innerText = 'RADAR — ' + (r.data.radar ? 'ON' : 'OFF')
-        }
+        await loadStatus(true)
       } catch (e) { appendToLogBox('! radar off error: ' + e.message) }
     }
 
@@ -1031,10 +993,17 @@ app.get('/', (req, res) => {
           img.src = '/wa/qr-img?ts=' + Date.now()
           appendToLogBox('QR pending — image refreshed')
         }
-        if (s.data && typeof s.data.radar !== 'undefined') {
-          document.getElementById('radar_state').innerText = s.data.radar ? 'ON' : 'OFF'
-          document.getElementById('radar_toggle').innerText = 'RADAR — ' + (s.data.radar ? 'ON' : 'OFF')
-        }
+
+        // pull radar status and update button label
+        try {
+          const r2 = await callApi('/radar/status')
+          const enabled = !!(r2 && r2.data && r2.data.enabled)
+          const btn = document.getElementById('radar_toggle')
+          btn.innerText = enabled ? 'RADAR — ON' : 'RADAR — OFF'
+          appendToLogBox('<- radar status: ' + enabled)
+        } catch (e) { appendToLogBox('! radar status fetch error: ' + e.message) }
+
+        // always pull tail logs if force
         if (forceLogs) {
           try {
             const r = await fetch('/logs/tail?lines=120')
@@ -1062,19 +1031,12 @@ app.get('/', (req, res) => {
 // ---- startup ----
 ;(async () => {
   try {
-    // загрузим состояние RADAR из диска
-    radarEnabled = loadRadarState()
-    infoLog(`🔧 Конфигурация: CONFIG_GROUP_ID=${CONFIG_GROUP_ID || ''} CONFIG_GROUP_NAME=${CONFIG_GROUP_NAME || ''} TELEGRAM_SOURCE=${TELEGRAM_SOURCE || ''} RADAR=${radarEnabled ? 'ON' : 'OFF'}`)
+    infoLog(`🔧 Конфигурация: CONFIG_GROUP_ID=${CONFIG_GROUP_ID || ''} CONFIG_GROUP_NAME=${CONFIG_GROUP_NAME || ''} TELEGRAM_SOURCE=${TELEGRAM_SOURCE || ''}`)
     await startTelegram()
     await startWhatsApp({ reset: false })
     app.listen(Number(PORT), () => {
       infoLog(`🌐 HTTP доступен: ${UI_DOMAIN} (port ${PORT})`)
-      appendLogLine('Available endpoints: /, /ping, /healthz, /tg/status, /tg/send, /wa/status, /wa/groups, /wa/send, /wa/qr, /wa/qr-img, /wa/qr-ascii, /wa/reset, /wa/relogin, /wa/auth-status, /wa/recent-forwarded, /wa/recent-messages, /logs, /logs/tail, /radar/status, /radar/set')
-      // попробуем отправить сервисное сообщение при старте (если WA уже подключён — отправка произойдёт,
-      // иначе она будет отложена и отправится после подключения/кэширования группы)
-      setTimeout(() => {
-        sendRadarStateMessage().catch(()=>{})
-      }, 1500)
+      appendLogLine('Available endpoints: /, /ping, /healthz, /tg/status, /tg/send, /wa/status, /wa/groups, /wa/send, /wa/qr, /wa/qr-img, /wa/qr-ascii, /wa/reset, /wa/relogin, /wa/auth-status, /wa/recent-forwarded, /wa/recent-messages, /logs, /logs/tail, /radar/status, /radar/toggle, /radar/on, /radar/off')
     })
   } catch (e) {
     errorLog('❌ Ошибка старта: ' + (e?.message || e))
