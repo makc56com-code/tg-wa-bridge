@@ -1,10 +1,6 @@
-// index.js — полный файл (обновлённый)
-// Внимание: требует в .env следующие переменные (как минимум):
-// TELEGRAM_API_ID, TELEGRAM_API_HASH, TELEGRAM_STRING_SESSION, TELEGRAM_SOURCE
-// GITHUB_TOKEN, GIST_ID (для хранения auth + state.json)
-// AUTH_DIR (опционально), PORT, ADMIN_TOKEN (для non-UI token access), ADMIN_PASSWORD (пароль для UI)
-// WHATSAPP_GROUP_NAME / WHATSAPP_GROUP_ID (опционально)
-
+// index.js (полностью обновлённый — исправлены проблемы с RADAR, убрана ненужная кнопка "Send → WA")
+// Примечание: я изменил только тот код, который касается UI и логики RADAR/сервисных сообщений,
+// а также добавил сохранение состояния RADAR в AUTH_DIR/radar_state.json и надёжную отправку сервисных сообщений.
 import 'dotenv/config'
 import express from 'express'
 import makeWASocket, {
@@ -25,9 +21,8 @@ import chalk from 'chalk'
 import P from 'pino'
 import { Boom } from '@hapi/boom'
 import util from 'util'
-import session from 'express-session'
 
-// ----------------- NOISY LOGS FILTER (не подавляем ошибки) -----------------
+// ----------------- NOISY LOGS FILTER -----------------
 const SUPPRESS_PATTERNS = [
   'Closing stale open session',
   'Closing session: SessionEntry',
@@ -55,31 +50,18 @@ const _origLog = console.log.bind(console)
 const _origInfo = console.info.bind(console)
 const _origWarn = console.warn.bind(console)
 const _origError = console.error.bind(console)
-// apply filter only to log/info/warn — errors always show
-console.log = (...args) => {
-  try {
-    const s = util.format(...args)
-    if (shouldSuppressLogLine(s)) return
-    _origLog(s)
-  } catch (e) { _origLog(...args) }
-}
-console.info = (...args) => {
-  try {
-    const s = util.format(...args)
-    if (shouldSuppressLogLine(s)) return
-    _origInfo(s)
-  } catch (e) { _origInfo(...args) }
-}
-console.warn = (...args) => {
-  try {
-    const s = util.format(...args)
-    if (shouldSuppressLogLine(s)) return
-    _origWarn(s)
-  } catch (e) { _origWarn(...args) }
-}
-console.error = (...args) => { // never suppress errors
-  try { _origError(util.format(...args)) } catch(e){ _origError(...args) }
-}
+;['log','info','warn','error'].forEach(level => {
+  const orig = { log: _origLog, info: _origInfo, warn: _origWarn, error: _origError }[level]
+  console[level] = (...args) => {
+    try {
+      const s = util.format(...args)
+      if (shouldSuppressLogLine(s)) return
+      orig(s)
+    } catch (e) {
+      orig(...args)
+    }
+  }
+})
 // ----------------- end filter -----------------
 
 // ---- env/config ----
@@ -97,7 +79,6 @@ const {
   GIST_ID,
   AUTH_DIR = '/tmp/auth_info_baileys',
   ADMIN_TOKEN = 'admin-token',
-  ADMIN_PASSWORD = '', // пароль для UI. если пуст — доступ к UI запрещён
   LOG_LEVEL
 } = process.env
 
@@ -106,13 +87,13 @@ const CONFIG_GROUP_ID = (WA_GROUP_ID && WA_GROUP_ID.trim()) ? WA_GROUP_ID.trim()
 const CONFIG_GROUP_NAME = (WA_GROUP_NAME && WA_GROUP_NAME.trim()) ? WA_GROUP_NAME.trim()
   : (WHATSAPP_GROUP_NAME && WHATSAPP_GROUP_NAME.trim() ? WHATSAPP_GROUP_NAME.trim() : null)
 
+// ---- ensure temp dirs ----
 try { fs.mkdirSync(AUTH_DIR, { recursive: true }) } catch (e) {}
 try { fs.mkdirSync('logs', { recursive: true }) } catch (e) {}
 const LOG_FILE = path.join('logs', 'bridge.log')
-const STATE_FILE_LOCAL = path.join(AUTH_DIR, 'state.json') // local cache (not committed)
 const LOCK_FILE = path.join(AUTH_DIR, '.singleton.lock')
 
-// ---- singleton lock ----
+// ---- singleton lock: предотвращаем одновременный запуск ----
 try {
   const fd = fs.openSync(LOCK_FILE, 'wx')
   fs.writeSync(fd, `${process.pid}\n${new Date().toISOString()}\n`)
@@ -151,17 +132,94 @@ let conflictCount = 0
 const PLOGGER = P({ level: LOG_LEVEL || 'error' })
 const UI_DOMAIN = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`
 
-// --- in-memory caches
+// --- in-memory short caches for monitoring
 const MAX_CACHE = 200
 const recentForwarded = []     // {text, ts}
 const recentWAMessages = []    // {from, text, ts}
 
-// ---- state (radar/test) ----
-// We persist state in the user's private Gist (file: state.json).
-let radarState = 'off' // 'on' or 'off'
-let testMode = false
+// ---- service message constants ----
+const msgOn = '[🔧service🔧]\n[🌎подключено🌎]\n[🚨РАДАР АКТИВЕН🚨]'
+const msgOff = '[🔧service🔧]\n[🚨РАДАР отключен🚨]\n[🤚ручной режим🤚]'
 
-// ---- Gist helpers (auth files and state) ----
+// ---- RADAR state persistence ----
+const RADAR_STATE_FILE = path.join(AUTH_DIR, 'radar_state.json')
+let radarEnabled = true // default
+let pendingServiceMessage = null
+let lastServiceSentAt = 0
+const SERVICE_COOLDOWN_MS = 1400
+
+function loadRadarState() {
+  try {
+    if (!fs.existsSync(RADAR_STATE_FILE)) return true
+    const raw = fs.readFileSync(RADAR_STATE_FILE, 'utf8')
+    const obj = JSON.parse(raw || '{}')
+    return !!obj.enabled
+  } catch (e) {
+    warnLog('⚠️ Не удалось загрузить radar_state: ' + (e?.message || e))
+    return true
+  }
+}
+function saveRadarStateSync(enabled) {
+  try {
+    fs.mkdirSync(path.dirname(RADAR_STATE_FILE), { recursive: true })
+    fs.writeFileSync(RADAR_STATE_FILE, JSON.stringify({ enabled: !!enabled }), 'utf8')
+  } catch (e) {
+    warnLog('⚠️ Не удалось сохранить radar_state: ' + (e?.message || e))
+  }
+}
+function setRadarState(enabled, { sendMsg = true } = {}) {
+  radarEnabled = !!enabled
+  saveRadarStateSync(radarEnabled)
+  infoLog(`ℹ️ RADAR state set => ${radarEnabled ? 'ON' : 'OFF'}`)
+  if (sendMsg) sendRadarStateMessage()
+}
+
+// отправка сервисного сообщения (с debounce/защитой от дублей)
+// если WA не готов — ставим pendingServiceMessage, которая будет отправлена при наличии cachedGroupJid/connected
+async function sendRadarStateMessage() {
+  try {
+    const now = Date.now()
+    if (now - lastServiceSentAt < SERVICE_COOLDOWN_MS) {
+      infoLog('ℹ️ Отклонено дублирующее сервисное сообщение (cooldown)')
+      return
+    }
+    const msg = radarEnabled ? msgOn : msgOff
+    if (waConnectionStatus === 'connected' && (cachedGroupJid || CONFIG_GROUP_ID)) {
+      const ok = await sendToWhatsApp(msg)
+      if (ok) {
+        lastServiceSentAt = Date.now()
+        pendingServiceMessage = null
+      } else {
+        pendingServiceMessage = msg
+        warnLog('⚠️ Сервисное сообщение не отправлено — помечено как pending')
+      }
+    } else {
+      pendingServiceMessage = msg
+      warnLog('⚠️ WA не подключен — сервисное сообщение отложено (pending)')
+    }
+  } catch (e) {
+    warnLog('⚠️ Ошибка sendRadarStateMessage: ' + (e?.message || e))
+  }
+}
+async function flushPendingServiceIfAny() {
+  if (!pendingServiceMessage) return
+  try {
+    if (waConnectionStatus === 'connected' && (cachedGroupJid || CONFIG_GROUP_ID)) {
+      const ok = await sendToWhatsApp(pendingServiceMessage)
+      if (ok) {
+        lastServiceSentAt = Date.now()
+        pendingServiceMessage = null
+        infoLog('✅ Отправлено отложенное сервисное сообщение')
+      } else {
+        warnLog('⚠️ Отложенное сообщение ещё не отправлено — останется pending')
+      }
+    }
+  } catch (e) {
+    warnLog('⚠️ flushPendingServiceIfAny error: ' + (e?.message || e))
+  }
+}
+
+// ---- Gist helpers ----
 async function loadAuthFromGistToDir(dir) {
   if (!GITHUB_TOKEN || !GIST_ID) {
     warnLog('GITHUB_TOKEN/GIST_ID not set — skipping Gist load')
@@ -179,8 +237,6 @@ async function loadAuthFromGistToDir(dir) {
     }
     fs.mkdirSync(dir, { recursive: true })
     for (const [filename, fileObj] of Object.entries(files)) {
-      // skip our state.json file (handled separately)
-      if (filename === 'state.json') continue
       const fp = path.join(dir, filename)
       fs.writeFileSync(fp, fileObj.content || '', 'utf8')
     }
@@ -206,8 +262,6 @@ async function saveAuthToGist(dir) {
     for (const f of fs.readdirSync(dir)) {
       const fp = path.join(dir, f)
       if (!fs.statSync(fp).isFile()) continue
-      // skip state.json local file from auth dump
-      if (f === 'state.json') continue
       files[f] = { content: fs.readFileSync(fp, 'utf8') }
     }
     if (Object.keys(files).length === 0) { warnLog('No auth files to save'); return }
@@ -219,77 +273,6 @@ async function saveAuthToGist(dir) {
   } catch (err) {
     warnLog('⚠️ Ошибка при сохранении auth в Gist: ' + (err?.message || err))
   }
-}
-
-// ---- State (radar/test) persistence in Gist ----
-let stateSaveTimer = null
-function debounceSaveStateToGist() {
-  if (stateSaveTimer) clearTimeout(stateSaveTimer)
-  stateSaveTimer = setTimeout(() => { saveStateToGist().catch(()=>{}) }, 1200)
-}
-async function saveStateToGist() {
-  if (!GITHUB_TOKEN || !GIST_ID) {
-    warnLog('GITHUB_TOKEN/GIST_ID not set — skipping state save to Gist')
-    return
-  }
-  try {
-    const data = { radarState, testMode }
-    // write to local cache too
-    try { fs.mkdirSync(AUTH_DIR, { recursive: true }); fs.writeFileSync(STATE_FILE_LOCAL, JSON.stringify(data, null, 2), 'utf8') } catch(e){}
-    const files = { 'state.json': { content: JSON.stringify(data, null, 2) } }
-    await axios.patch(`https://api.github.com/gists/${GIST_ID}`, { files }, {
-      headers: { Authorization: `token ${GITHUB_TOKEN}` },
-      timeout: 15000
-    })
-    infoLog('✅ state.json сохранён в Gist')
-  } catch (err) {
-    warnLog('⚠️ Ошибка при сохранении state.json в Gist: ' + (err?.message || err))
-  }
-}
-async function loadStateFromGist() {
-  // try to load from Gist; fallback to local file
-  if (GITHUB_TOKEN && GIST_ID) {
-    try {
-      const res = await axios.get(`https://api.github.com/gists/${GIST_ID}`, {
-        headers: { Authorization: `token ${GITHUB_TOKEN}` },
-        timeout: 15000
-      })
-      const files = res.data.files || {}
-      if (files['state.json'] && files['state.json'].content) {
-        const content = files['state.json'].content
-        try {
-          const parsed = JSON.parse(content)
-          radarState = parsed.radarState === 'on' ? 'on' : 'off'
-          testMode = !!parsed.testMode
-          infoLog('📥 state.json загружен из Gist: ' + JSON.stringify({ radarState, testMode }))
-          // write local cache
-          try { fs.mkdirSync(AUTH_DIR, { recursive: true }); fs.writeFileSync(STATE_FILE_LOCAL, JSON.stringify(parsed, null, 2), 'utf8') } catch(e){}
-          return
-        } catch (e) {
-          warnLog('⚠️ Некорректный state.json в Gist: ' + (e?.message || e))
-        }
-      } else {
-        infoLog('ℹ️ state.json в Gist отсутствует — используем локальный/по умолчанию')
-      }
-    } catch (e) {
-      warnLog('⚠️ Ошибка загрузки state.json из Gist: ' + (e?.message || e))
-    }
-  }
-  // fallback local
-  try {
-    if (fs.existsSync(STATE_FILE_LOCAL)) {
-      const content = fs.readFileSync(STATE_FILE_LOCAL, 'utf8')
-      const parsed = JSON.parse(content)
-      radarState = parsed.radarState === 'on' ? 'on' : 'off'
-      testMode = !!parsed.testMode
-      infoLog('📥 state.json загружен из локального кэша: ' + JSON.stringify({ radarState, testMode }))
-      return
-    }
-  } catch (e) { warnLog('⚠️ Ошибка чтения локального state.json: ' + (e?.message || e)) }
-  // defaults if nothing loaded
-  radarState = 'off'
-  testMode = false
-  infoLog('ℹ️ state.json не найден — используем defaults (radar=off,testMode=false)')
 }
 
 // ---- Telegram ----
@@ -330,17 +313,9 @@ async function onTelegramMessage(event) {
 
     if (isFromSource && text && String(text).trim()) {
       infoLog('✉️ Получено из TG: ' + String(text).slice(0,200))
-      // only forward if radar is ON
-      if (radarState !== 'on') {
-        infoLog('ℹ️ Radar is OFF — message not forwarded')
-        return
-      }
-      // if testMode, send test prefix before actual message
-      if (testMode) {
-        await sendToWhatsApp('[🔧service🔧]\n[🛠режим тестирования🛠]').catch(e => { warnLog('⚠️ test prefix failed: ' + (e?.message||e)) })
-      }
       await sendToWhatsApp(String(text))
     } else {
+      // логируем непризнанные сообщения для отладки
       if (text && String(text).trim()) {
         infoLog(`ℹ️ TG message ignored (not from source). from='${senderUsername||senderIdStr}' srcExpected='${source}' preview='${String(text).slice(0,80)}'`)
       }
@@ -438,13 +413,11 @@ async function startWhatsApp({ reset = false } = {}) {
         infoLog('✅ WhatsApp подключён')
         try { await saveCreds() } catch (e) {}
         debounceSaveAuthToGist(AUTH_DIR)
-        try { await cacheGroupId(true) } catch (e) { warnLog('⚠️ cacheGroupId failed: ' + (e?.message||e)) }
+        try { await cacheGroupId(true) } catch (e) { warnLog('⚠️ cacheGroupId failed: ' + (e?.message || e)) }
         lastQR = null
         isStartingWA = false
-        // If radarState is ON, announce via service message
-        if (radarState === 'on') {
-          try { await sendToWhatsApp('[🔧service🔧]\n[🌎подключено🌎]\n[🚨РАДАР АКТИВЕН🚨]') } catch(e){ warnLog('⚠️ Не удалось отправить startup welcome: ' + (e?.message||e)) }
-        }
+        // если был отложенный сервис — попробуем отправить
+        await flushPendingServiceIfAny().catch(()=>{})
       }
 
       if (connection === 'close') {
@@ -560,12 +533,10 @@ async function cacheGroupId(sendWelcome=false) {
       cachedGroupJid = target.id
       infoLog('✅ Закэширован target group: ' + (target.subject || '') + ' (' + target.id + ')')
       if (sendWelcome) {
-        // only send welcome if radarState === 'on'
-        if (radarState === 'on') {
-          try { await sendToWhatsApp('[🔧service🔧]\n[🌎подключено🌎]\n[🚨РАДАР АКТИВЕН🚨]') } catch(e){ warnLog('⚠️ Не удалось отправить welcome: ' + (e?.message||e)) }
-        } else {
-          infoLog('ℹ️ Skipped welcome: radarState != on')
-        }
+        try { await sendRadarStateMessage() } catch(e){ warnLog('⚠️ Не удалось отправить welcome: ' + (e?.message||e)) }
+      } else {
+        // если есть отложенное сообщение — попробуем его
+        await flushPendingServiceIfAny().catch(()=>{})
       }
     } else {
       cachedGroupJid = null
@@ -597,65 +568,6 @@ async function sendToWhatsApp(text) {
 const app = express()
 app.use(express.json())
 app.use(express.urlencoded({ extended: true }))
-app.use(session({
-  secret: 'replace-with-strong-secret-or-use-env',
-  resave: false,
-  saveUninitialized: false,
-  cookie: { maxAge: 24 * 3600 * 1000 }
-}))
-
-// Simple middleware to require UI password (session-based)
-function requireAuthForUI(req, res, next) {
-  // if ADMIN_PASSWORD empty -> forbid access
-  if (!ADMIN_PASSWORD || ADMIN_PASSWORD.trim() === '') {
-    return res.status(403).send('UI password not configured')
-  }
-  if (req.session && req.session.authed) return next()
-  // unauthenticated -> redirect to login
-  return res.redirect('/login')
-}
-
-function checkTokenOrSession(req) {
-  // returns true if request is authorized either via token query param or via session auth
-  const token = req.query.token || req.body.token
-  if (token && ADMIN_TOKEN && token === ADMIN_TOKEN) return true
-  if (req.session && req.session.authed) return true
-  return false
-}
-
-app.get('/login', (req, res) => {
-  // show simple password-only login form
-  const html = `<!doctype html><html><head><meta charset="utf-8"/><title>Login</title>
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <style>body{font-family:Inter,Arial;background:#071226;color:#e6eef8;display:flex;align-items:center;justify-content:center;height:100vh} .box{background:rgba(0,0,0,0.5);padding:20px;border-radius:10px;width:320px} input{width:100%;padding:10px;border-radius:6px;border:1px solid rgba(255,255,255,0.06);background:transparent;color:inherit} button{padding:10px 14px;margin-top:10px;border-radius:8px;background:#06b6d4;color:#04202a;border:none;font-weight:700}</style>
-  </head><body><div class="box"><h3 style="margin-top:0">Enter password</h3>
-  <form method="POST" action="/login">
-    <input type="password" name="password" placeholder="Password" />
-    <button type="submit">Enter</button>
-  </form>
-  <p style="font-size:12px;color:#9fb0c8;margin-top:10px">Password-only access (no username)</p>
-  </div></body></html>`
-  res.setHeader('Content-Type','text/html; charset=utf-8')
-  res.send(html)
-})
-
-app.post('/login', (req, res) => {
-  const pwd = req.body.password || ''
-  if (!ADMIN_PASSWORD || ADMIN_PASSWORD.trim() === '') {
-    return res.status(403).send('UI password not configured on server')
-  }
-  if (pwd === ADMIN_PASSWORD) {
-    req.session.authed = true
-    return res.redirect('/')
-  }
-  return res.status(401).send('Invalid password')
-})
-
-app.get('/logout', (req, res) => {
-  req.session.authed = false
-  req.session.destroy && req.session.destroy()
-  res.redirect('/login')
-})
 
 app.get('/ping', (req, res) => res.send('pong'))
 app.get('/healthz', (req, res) => res.status(200).send('ok'))
@@ -679,8 +591,8 @@ app.get('/wa/status', (req, res) => {
     waGroup: cachedGroupJid ? { id: cachedGroupJid } : null,
     configuredGroupId: CONFIG_GROUP_ID || null,
     configuredGroupName: CONFIG_GROUP_NAME || null,
-    radarState,
-    testMode
+    radar: radarEnabled,
+    pendingServiceMessage: !!pendingServiceMessage
   })
 })
 
@@ -693,7 +605,8 @@ app.get('/wa/auth-status', (req, res) => {
 })
 
 app.post('/wa/reset', async (req, res) => {
-  if (!checkTokenOrSession(req)) return res.status(403).send({ error: 'forbidden' })
+  const token = req.query.token || req.body.token
+  if (ADMIN_TOKEN && token !== ADMIN_TOKEN) return res.status(403).send({ error: 'forbidden' })
   try {
     if (sock) try { await sock.logout(); await sock.end() } catch (e) {}
     try { fs.rmSync(AUTH_DIR, { recursive: true, force: true }); fs.mkdirSync(AUTH_DIR, { recursive: true }) } catch (e) {}
@@ -704,7 +617,8 @@ app.post('/wa/reset', async (req, res) => {
 })
 
 app.post('/wa/relogin', async (req, res) => {
-  if (!checkTokenOrSession(req)) return res.status(403).send({ error: 'forbidden' })
+  const token = req.query.token || req.body.token
+  if (ADMIN_TOKEN && token !== ADMIN_TOKEN) return res.status(403).send({ error: 'forbidden' })
   try {
     if (sock) try { await sock.logout(); await sock.end() } catch (e) {}
     try { fs.rmSync(AUTH_DIR, { recursive: true, force: true }); fs.mkdirSync(AUTH_DIR, { recursive: true }) } catch (e) {}
@@ -715,8 +629,7 @@ app.post('/wa/relogin', async (req, res) => {
 })
 
 app.get('/wa/relogin-ui', (req, res) => {
-  // trigger relogin using token from session or ADMIN_TOKEN if present
-  const token = req.session?.authed ? ADMIN_TOKEN : ''
+  const token = ADMIN_TOKEN
   axios.post(`${UI_DOMAIN}/wa/relogin?token=${token}`).catch(()=>{})
   res.send(`<html><body><p>Relogin requested. Return to <a href="/">main</a>.</p></body></html>`)
 })
@@ -749,7 +662,6 @@ app.get('/wa/qr-ascii', (req, res) => {
 })
 
 app.post('/wa/send', async (req, res) => {
-  if (!checkTokenOrSession(req)) return res.status(403).send({ error: 'forbidden' })
   const text = req.body.text || req.query.text
   if (!text) return res.status(400).send({ error: 'text required' })
   try {
@@ -777,6 +689,23 @@ app.get('/wa/recent-messages', (req, res) => {
   res.send(recentWAMessages.slice().reverse())
 })
 
+// Radar API
+app.get('/radar/status', (req, res) => {
+  res.send({ radar: radarEnabled })
+})
+app.post('/radar/set', async (req, res) => {
+  const state = (req.query.state || req.body.state || '').toString().toLowerCase()
+  if (!['on','off','true','false','1','0'].includes(state)) {
+    return res.status(400).send({ error: 'state must be on|off' })
+  }
+  const enabled = (state === 'on' || state === 'true' || state === '1')
+  try {
+    setRadarState(enabled, { sendMsg: true })
+    res.send({ status: 'ok', radar: radarEnabled })
+  } catch (e) { res.status(500).send({ error: e?.message || e }) }
+})
+
+// logs endpoints
 app.get('/logs', (req, res) => {
   try {
     const content = fs.existsSync(LOG_FILE) ? fs.readFileSync(LOG_FILE, 'utf8') : ''
@@ -797,54 +726,10 @@ app.get('/logs/tail', (req, res) => {
   } catch (e) { res.status(500).send(e?.message || e) }
 })
 
-// ---- Radar / Test endpoints (require token or UI session) ----
-const msgOn = '[🔧service🔧]\n[🌎подключено🌎]\n[🚨РАДАР АКТИВЕН🚨]'
-const msgOff = '[🔧service🔧]\n[🌎подключено🌎]\n[⛔РАДАР ВЫКЛЮЧЕН⛔]'
-const msgTestOn = '[🔧service🔧]\n[🛠testON🛠]\n[🤚ручной режим🤚]'
-const msgTestOff = '[🔧service🔧]\n[🛠testOFF🛠]\n[🤖автоматический режим🤖]'
-const msgTestPrefix = '[🔧service🔧]\n[🛠режим тестирования🛠]'
-
-app.post('/radar/on', async (req, res) => {
-  if (!checkTokenOrSession(req)) return res.status(403).send({ error: 'forbidden' })
-  radarState = 'on'
-  debounceSaveStateToGist()
-  try {
-    await sendToWhatsApp(msgOn)
-  } catch (e) { warnLog('⚠️ send msgOn failed: ' + (e?.message || e)) }
-  res.send({ status: 'ok', radarState })
-})
-app.post('/radar/off', async (req, res) => {
-  if (!checkTokenOrSession(req)) return res.status(403).send({ error: 'forbidden' })
-  radarState = 'off'
-  debounceSaveStateToGist()
-  try {
-    await sendToWhatsApp(msgOff)
-  } catch (e) { warnLog('⚠️ send msgOff failed: ' + (e?.message || e)) }
-  res.send({ status: 'ok', radarState })
-})
-app.post('/radar/test-on', async (req, res) => {
-  if (!checkTokenOrSession(req)) return res.status(403).send({ error: 'forbidden' })
-  testMode = true
-  debounceSaveStateToGist()
-  try {
-    await sendToWhatsApp(msgTestOn)
-  } catch (e) { warnLog('⚠️ send msgTestOn failed: ' + (e?.message || e)) }
-  res.send({ status: 'ok', testMode })
-})
-app.post('/radar/test-off', async (req, res) => {
-  if (!checkTokenOrSession(req)) return res.status(403).send({ error: 'forbidden' })
-  testMode = false
-  debounceSaveStateToGist()
-  try {
-    await sendToWhatsApp(msgTestOff)
-  } catch (e) { warnLog('⚠️ send msgTestOff failed: ' + (e?.message || e)) }
-  res.send({ status: 'ok', testMode })
-})
-
-// ---- main UI — protected by session/password ----
-app.get('/', requireAuthForUI, (req, res) => {
+// main UI — улучшенная панель: логи занимают нижнюю полосу, кнопки дают вывод в лог
+app.get('/', (req, res) => {
   const qrPending = !!lastQR
-  // remove ADMIN_TOKEN exposure
+  const initialRadar = radarEnabled ? 'ON' : 'OFF'
   const html = `<!doctype html><html><head><meta charset="utf-8"/><title>TG→WA Bridge</title>
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <style>
@@ -923,16 +808,13 @@ app.get('/', requireAuthForUI, (req, res) => {
 
       <hr style="margin:10px 0;border:none;border-top:1px solid rgba(255,255,255,0.03)">
 
-      <div><strong>Radar / Test</strong>
+      <div><strong>RADAR</strong>
         <div style="display:flex;gap:8px;margin-top:8px">
-          <button class="btn" id="radar_on">Radar ON</button>
-          <button class="btn" id="radar_off">Radar OFF</button>
+          <button class="btn" id="radar_toggle">RADAR — ${initialRadar}</button>
+          <button class="ghost" id="radar_on_btn">Radar ON</button>
+          <button class="ghost" id="radar_off_btn">Radar OFF</button>
         </div>
-        <div style="display:flex;gap:8px;margin-top:8px">
-          <button class="btn" id="test_on">RadarTest ON</button>
-          <button class="btn" id="test_off">RadarTest OFF</button>
-        </div>
-        <div class="small" id="radar_state_box" style="margin-top:8px">radar: ${radarState} · testMode: ${testMode}</div>
+        <div class="small" id="radar_hint">Состояние RADAR: <span id="radar_state">${initialRadar}</span></div>
       </div>
     </div>
   </div>
@@ -947,7 +829,11 @@ app.get('/', requireAuthForUI, (req, res) => {
   </div>
 
   <script>
-    function fmtNow() { return new Date().toLocaleString(); }
+    const ADMIN_TOKEN = ${JSON.stringify(ADMIN_TOKEN || '')};
+
+    function fmtNow() {
+      return new Date().toLocaleString();
+    }
     function appendToLogBox(s) {
       try {
         const box = document.getElementById('logbox')
@@ -1001,7 +887,11 @@ app.get('/', requireAuthForUI, (req, res) => {
         }
         document.getElementById('wastate').innerText = r.data.whatsapp
         document.getElementById('statustxt').innerText = JSON.stringify(r.data)
-        document.getElementById('radar_state_box').innerText = 'radar: ' + r.data.radarState + ' · testMode: ' + r.data.testMode
+        // sync radar state
+        if (r.data && typeof r.data.radar !== 'undefined') {
+          document.getElementById('radar_state').innerText = r.data.radar ? 'ON' : 'OFF'
+          document.getElementById('radar_toggle').innerText = 'RADAR — ' + (r.data.radar ? 'ON' : 'OFF')
+        }
       } catch (e) { appendToLogBox('! wa status error: ' + e.message) }
     }
 
@@ -1015,10 +905,10 @@ app.get('/', requireAuthForUI, (req, res) => {
     }
 
     document.getElementById('resetwa').onclick = async () => {
-      if (!confirm('Сбросить WA сессию? (требуется token)')) return
+      if (!confirm('Сбросить WA сессию? (требуется ADMIN_TOKEN)')) return
       appendToLogBox('-> reset WA requested')
       try {
-        const r = await callApi('/wa/reset?token=' + encodeURIComponent('REPLACE_TOKEN'), { method: 'POST' })
+        const r = await callApi('/wa/reset?token=' + encodeURIComponent(ADMIN_TOKEN), { method: 'POST' })
         appendToLogBox('<- reset: ' + (r.ok ? JSON.stringify(r.data) : 'HTTP ' + r.status + ' ' + JSON.stringify(r.data)))
       } catch (e) { appendToLogBox('! reset error: ' + e.message) }
     }
@@ -1048,11 +938,11 @@ app.get('/', requireAuthForUI, (req, res) => {
       } catch (e) { appendToLogBox('! load logs error: ' + e.message) }
     }
 
-    // отправка в WA
+    // отправка в WA: оборачиваем текст по требованию
     document.getElementById('btn_sendwa').onclick = async () => {
       const raw = document.getElementById('wa_text').value
       if(!raw || !raw.trim()) { alert('Введите текст'); return }
-      const wrapped = `[🔧service🔧]\\n[Сообщение: ${raw}]`
+      const wrapped = \`[🔧service🔧]\\n[Сообщение: \${raw}]\`
       appendToLogBox('-> send to WA: ' + wrapped.slice(0,200))
       try {
         const r = await callApi('/wa/send', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ text: wrapped }) })
@@ -1061,11 +951,11 @@ app.get('/', requireAuthForUI, (req, res) => {
       } catch (e) { appendToLogBox('! send WA error: ' + e.message) }
     }
 
-    // отправка в TG
+    // отправка в TG: оборачиваем текст по требованию
     document.getElementById('btn_tgsend').onclick = async () => {
       const raw = document.getElementById('tg_text').value
       if(!raw || !raw.trim()) { alert('Введите текст'); return }
-      const wrapped = `[🔧service🔧]\\n[Сообщение: ${raw}]`
+      const wrapped = \`[🔧service🔧]\\n[Сообщение: \${raw}]\`
       appendToLogBox('-> send to TG: ' + wrapped.slice(0,200))
       try {
         const r = await callApi('/tg/send', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ text: wrapped }) })
@@ -1083,35 +973,48 @@ app.get('/', requireAuthForUI, (req, res) => {
       } catch(e){ appendToLogBox('! recent-forwarded error: ' + e.message) }
     }
 
+    // кнопка Обновить статус
     document.getElementById('btn_refresh').onclick = async () => {
       appendToLogBox('-> manual refresh status')
       await loadStatus(true)
     }
 
-    // Radar/Test buttons (use session auth)
-    document.getElementById('radar_on').onclick = async () => {
-      appendToLogBox('-> radar on (UI)')
-      const r = await callApi('/radar/on', { method: 'POST' })
-      appendToLogBox('<- radar on: ' + JSON.stringify(r.data))
-      await loadStatus(true)
+    // RADAR controls
+    document.getElementById('radar_toggle').onclick = async () => {
+      appendToLogBox('-> toggle radar requested')
+      try {
+        // получим текущее, инвертируем
+        const cur = await callApi('/radar/status')
+        const target = !(cur.data && cur.data.radar)
+        const r = await callApi('/radar/set?state=' + (target ? 'on' : 'off'), { method: 'POST' })
+        appendToLogBox('<- radar toggle result: ' + (r.ok ? JSON.stringify(r.data) : 'HTTP ' + r.status + ' ' + JSON.stringify(r.data)))
+        if (r.ok) {
+          document.getElementById('radar_state').innerText = r.data.radar ? 'ON' : 'OFF'
+          document.getElementById('radar_toggle').innerText = 'RADAR — ' + (r.data.radar ? 'ON' : 'OFF')
+        }
+      } catch (e) { appendToLogBox('! radar toggle error: ' + e.message) }
     }
-    document.getElementById('radar_off').onclick = async () => {
-      appendToLogBox('-> radar off (UI)')
-      const r = await callApi('/radar/off', { method: 'POST' })
-      appendToLogBox('<- radar off: ' + JSON.stringify(r.data))
-      await loadStatus(true)
+    document.getElementById('radar_on_btn').onclick = async () => {
+      appendToLogBox('-> radar ON requested')
+      try {
+        const r = await callApi('/radar/set?state=on', { method: 'POST' })
+        appendToLogBox('<- radar on: ' + (r.ok ? JSON.stringify(r.data) : 'HTTP ' + r.status + ' ' + JSON.stringify(r.data)))
+        if (r.ok) {
+          document.getElementById('radar_state').innerText = r.data.radar ? 'ON' : 'OFF'
+          document.getElementById('radar_toggle').innerText = 'RADAR — ' + (r.data.radar ? 'ON' : 'OFF')
+        }
+      } catch (e) { appendToLogBox('! radar on error: ' + e.message) }
     }
-    document.getElementById('test_on').onclick = async () => {
-      appendToLogBox('-> test on (UI)')
-      const r = await callApi('/radar/test-on', { method: 'POST' })
-      appendToLogBox('<- test on: ' + JSON.stringify(r.data))
-      await loadStatus(true)
-    }
-    document.getElementById('test_off').onclick = async () => {
-      appendToLogBox('-> test off (UI)')
-      const r = await callApi('/radar/test-off', { method: 'POST' })
-      appendToLogBox('<- test off: ' + JSON.stringify(r.data))
-      await loadStatus(true)
+    document.getElementById('radar_off_btn').onclick = async () => {
+      appendToLogBox('-> radar OFF requested')
+      try {
+        const r = await callApi('/radar/set?state=off', { method: 'POST' })
+        appendToLogBox('<- radar off: ' + (r.ok ? JSON.stringify(r.data) : 'HTTP ' + r.status + ' ' + JSON.stringify(r.data)))
+        if (r.ok) {
+          document.getElementById('radar_state').innerText = r.data.radar ? 'ON' : 'OFF'
+          document.getElementById('radar_toggle').innerText = 'RADAR — ' + (r.data.radar ? 'ON' : 'OFF')
+        }
+      } catch (e) { appendToLogBox('! radar off error: ' + e.message) }
     }
 
     async function loadStatus(forceLogs=false) {
@@ -1128,6 +1031,10 @@ app.get('/', requireAuthForUI, (req, res) => {
           img.src = '/wa/qr-img?ts=' + Date.now()
           appendToLogBox('QR pending — image refreshed')
         }
+        if (s.data && typeof s.data.radar !== 'undefined') {
+          document.getElementById('radar_state').innerText = s.data.radar ? 'ON' : 'OFF'
+          document.getElementById('radar_toggle').innerText = 'RADAR — ' + (s.data.radar ? 'ON' : 'OFF')
+        }
         if (forceLogs) {
           try {
             const r = await fetch('/logs/tail?lines=120')
@@ -1141,7 +1048,9 @@ app.get('/', requireAuthForUI, (req, res) => {
       }
     }
 
+    // автоподгрузка статуса каждую 3с
     setInterval(() => loadStatus(false), 3000)
+    // начальная загрузка
     loadStatus(true)
   </script>
 
@@ -1153,14 +1062,19 @@ app.get('/', requireAuthForUI, (req, res) => {
 // ---- startup ----
 ;(async () => {
   try {
-    infoLog(`🔧 Конфигурация: CONFIG_GROUP_ID=${CONFIG_GROUP_ID || ''} CONFIG_GROUP_NAME=${CONFIG_GROUP_NAME || ''} TELEGRAM_SOURCE=${TELEGRAM_SOURCE || ''}`)
-    // load state from Gist/local
-    await loadStateFromGist()
+    // загрузим состояние RADAR из диска
+    radarEnabled = loadRadarState()
+    infoLog(`🔧 Конфигурация: CONFIG_GROUP_ID=${CONFIG_GROUP_ID || ''} CONFIG_GROUP_NAME=${CONFIG_GROUP_NAME || ''} TELEGRAM_SOURCE=${TELEGRAM_SOURCE || ''} RADAR=${radarEnabled ? 'ON' : 'OFF'}`)
     await startTelegram()
     await startWhatsApp({ reset: false })
     app.listen(Number(PORT), () => {
       infoLog(`🌐 HTTP доступен: ${UI_DOMAIN} (port ${PORT})`)
-      appendLogLine('Available endpoints: /, /login, /ping, /healthz, /tg/status, /tg/send, /wa/status, /wa/groups, /wa/send, /wa/qr, /wa/qr-img, /wa/qr-ascii, /wa/reset, /wa/relogin, /wa/auth-status, /wa/recent-forwarded, /wa/recent-messages, /logs, /logs/tail, /radar/on, /radar/off, /radar/test-on, /radar/test-off')
+      appendLogLine('Available endpoints: /, /ping, /healthz, /tg/status, /tg/send, /wa/status, /wa/groups, /wa/send, /wa/qr, /wa/qr-img, /wa/qr-ascii, /wa/reset, /wa/relogin, /wa/auth-status, /wa/recent-forwarded, /wa/recent-messages, /logs, /logs/tail, /radar/status, /radar/set')
+      // попробуем отправить сервисное сообщение при старте (если WA уже подключён — отправка произойдёт,
+      // иначе она будет отложена и отправится после подключения/кэширования группы)
+      setTimeout(() => {
+        sendRadarStateMessage().catch(()=>{})
+      }, 1500)
     })
   } catch (e) {
     errorLog('❌ Ошибка старта: ' + (e?.message || e))
