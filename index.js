@@ -25,14 +25,23 @@ const {
   TELEGRAM_API_HASH,
   TELEGRAM_STRING_SESSION,
   TG_SOURCE,
+  // primary names (legacy)
   WA_GROUP_ID,
   WA_GROUP_NAME,
+  // fallback names (user requested)
+  WHATSAPP_GROUP_ID,
+  WHATSAPP_GROUP_NAME,
   PORT = 3000,
   GITHUB_TOKEN,
   GIST_ID,
   AUTH_DIR = '/tmp/auth_info_baileys',
   ADMIN_TOKEN = 'admin-token'
 } = process.env
+
+// prefer explicit WA_GROUP_ID then WHATSAPP_GROUP_ID
+const CONFIG_GROUP_ID = (WA_GROUP_ID && WA_GROUP_ID.trim()) ? WA_GROUP_ID.trim() : (WHATSAPP_GROUP_ID && WHATSAPP_GROUP_ID.trim() ? WHATSAPP_GROUP_ID.trim() : null)
+// prefer WA_GROUP_NAME then WHATSAPP_GROUP_NAME
+const CONFIG_GROUP_NAME = (WA_GROUP_NAME && WA_GROUP_NAME.trim()) ? WA_GROUP_NAME.trim() : (WHATSAPP_GROUP_NAME && WHATSAPP_GROUP_NAME.trim() ? WHATSAPP_GROUP_NAME.trim() : null)
 
 // ---- ensure temp dirs ----
 try { fs.mkdirSync(AUTH_DIR, { recursive: true }) } catch (e) {}
@@ -57,6 +66,7 @@ let saveAuthTimer = null
 let restartTimer = null
 let restartCount = 0
 let cachedGroupJid = null
+let lastConflictAt = 0
 
 const PLOGGER = P({ level: 'warn' })
 const UI_DOMAIN = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`
@@ -168,9 +178,18 @@ async function onTelegramMessage(event) {
 
 // ---- WhatsApp ----
 function scheduleRestart({ reset = false } = {}) {
+  // if recent conflict, postpone
+  const now = Date.now()
+  if (now - lastConflictAt < 15_000 && !reset) {
+    infoLog('ℹ️ Недавний conflict — отложим рестарт на 15s')
+    if (restartTimer) return
+    restartTimer = setTimeout(() => { restartTimer = null; scheduleRestart({ reset }) }, 15_000)
+    return
+  }
+
   if (restartTimer) return
   restartCount = Math.min(restartCount + 1, 8)
-  const delay = Math.min(60000, Math.pow(2, restartCount) * 1000)
+  const delay = Math.min(120000, Math.pow(2, restartCount) * 1000) // cap 2 minutes
   infoLog(`ℹ️ Планируем рестарт WA через ${Math.round(delay/1000)}s (reset=${reset}, retryCount=${restartCount})`)
   restartTimer = setTimeout(() => {
     restartTimer = null
@@ -188,7 +207,7 @@ async function startWhatsApp({ reset = false } = {}) {
   isStartingWA = true
   waConnectionStatus = 'connecting'
   infoLog(`🚀 Запуск WhatsApp... reset=${reset}`)
-  infoLog(`🔎 Ищем группу по WA_GROUP_ID='${WA_GROUP_ID || ''}' WA_GROUP_NAME='${WA_GROUP_NAME || ''}'`)
+  infoLog(`🔎 Ищем группу по CONFIG_GROUP_ID='${CONFIG_GROUP_ID || ''}' CONFIG_GROUP_NAME='${CONFIG_GROUP_NAME || ''}'`)
 
   try { fs.mkdirSync(AUTH_DIR, { recursive: true }) } catch (e) {}
 
@@ -211,7 +230,12 @@ async function startWhatsApp({ reset = false } = {}) {
   }
 
   let version = undefined
-  try { version = (await fetchLatestBaileysVersion()).version } catch (e) {}
+  try {
+    const vinfo = await fetchLatestBaileysVersion()
+    version = vinfo?.version || vinfo?.[0]
+  } catch (e) {
+    warnLog('⚠️ Не удалось получить последнюю версию Baileys, используем дефолтную')
+  }
 
   try {
     sock = makeWASocket({
@@ -265,10 +289,16 @@ async function startWhatsApp({ reset = false } = {}) {
         try { code = new Boom(lastDisconnect?.error)?.output?.statusCode } catch (e) { code = lastDisconnect?.error?.output?.statusCode || null }
         warnLog('⚠️ WhatsApp соединение закрыто ' + (code || 'unknown'))
         try { await sock?.end?.() } catch (e) {}
-        if ([401, 428].includes(code)) {
+
+        if (code === 440) {
+          // conflict/stream error -> set lastConflictAt to avoid restart storm
+          lastConflictAt = Date.now()
+          warnLog('⚠️ Stream conflict (440). Не форсируем немедленный reset — даём cooldown.')
+          scheduleRestart({ reset: false })
+        } else if ([401, 428].includes(code)) {
           warnLog('❌ Сессия недействительна — запустим flow с новой авторизацией (QR)')
           scheduleRestart({ reset: true })
-        } else if ([409].includes(code)) {
+        } else if (code === 409) {
           warnLog('⚠️ Conflict (409) — ожидание, не форсируем рестарт')
           scheduleRestart({ reset: false })
         } else {
@@ -295,7 +325,6 @@ async function startWhatsApp({ reset = false } = {}) {
 // ---- improved cacheGroupId with debug logs and fuzzy matching ----
 function normalizeName(s) {
   if (!s) return ''
-  // remove surrounding quotes, extra spaces, lowercase
   return String(s).replace(/^[\s"'`]+|[\s"'`]+$/g, '').trim().toLowerCase()
 }
 function stripNonAlnum(s){
@@ -309,15 +338,15 @@ async function cacheGroupId(sendWelcome=false) {
     const list = Object.values(groups || {})
     infoLog(`🔎 Найдено ${list.length} групп(ы)`)
 
-    // build candidates array for logs
     const candidates = list.map(g => {
       return { id: g.id, name: g.subject || '' }
     })
     infoLog('📋 Доступные группы: ' + candidates.map(c => `${c.name}|${c.id}`).join(', '))
 
     // who we will search for
-    const cfgId = WA_GROUP_ID ? (String(WA_GROUP_ID).endsWith('@g.us') ? WA_GROUP_ID : String(WA_GROUP_ID) + '@g.us') : null
-    const cfgNameRaw = WA_GROUP_NAME || WA_GROUP_ID || null
+    const cfgIdRaw = CONFIG_GROUP_ID || null
+    const cfgId = cfgIdRaw ? (String(cfgIdRaw).endsWith('@g.us') ? cfgIdRaw : String(cfgIdRaw) + '@g.us') : null
+    const cfgNameRaw = CONFIG_GROUP_NAME || null
     const cfgName = normalizeName(cfgNameRaw)
     infoLog(`🔍 Ищу target by id=${cfgId} name="${cfgNameRaw}" (normalized="${cfgName}")`)
 
@@ -370,7 +399,6 @@ async function cacheGroupId(sendWelcome=false) {
     } else {
       cachedGroupJid = null
       warnLog('⚠️ Целевая группа не найдена; доступные: ' + candidates.map(g => `${g.name}|${g.id}`).join(', '))
-      // leave cachedGroupJid null; operator can inspect /wa/groups
     }
   } catch (e) {
     errorLog('❌ Ошибка cacheGroupId: ' + (e?.message || e))
@@ -381,7 +409,7 @@ async function cacheGroupId(sendWelcome=false) {
 async function sendToWhatsApp(text) {
   try {
     if (!sock || waConnectionStatus !== 'connected') { warnLog('⏳ WA не готов — сообщение не отправлено'); return false }
-    const jid = cachedGroupJid || (WA_GROUP_ID ? (WA_GROUP_ID.endsWith('@g.us') ? WA_GROUP_ID : WA_GROUP_ID + '@g.us') : null)
+    const jid = cachedGroupJid || (CONFIG_GROUP_ID ? (CONFIG_GROUP_ID.endsWith('@g.us') ? CONFIG_GROUP_ID : CONFIG_GROUP_ID + '@g.us') : null)
     if (!jid) { errorLog('❌ Нет идентификатора группы для отправки'); return false }
     await sock.sendMessage(jid, { text: String(text) })
     infoLog('➡️ Отправлено в WA: ' + String(text).slice(0, 200))
@@ -392,7 +420,7 @@ async function sendToWhatsApp(text) {
   }
 }
 
-// ---- HTTP + UI (same as before) ----
+// ---- HTTP + UI ----
 const app = express()
 app.use(express.json())
 
@@ -416,8 +444,8 @@ app.get('/wa/status', (req, res) => {
     whatsapp: waConnectionStatus,
     qrPending: !!lastQR,
     waGroup: cachedGroupJid ? { id: cachedGroupJid } : null,
-    configuredGroupId: WA_GROUP_ID || null,
-    configuredGroupName: WA_GROUP_NAME || null
+    configuredGroupId: CONFIG_GROUP_ID || null,
+    configuredGroupName: CONFIG_GROUP_NAME || null
   })
 })
 
@@ -542,7 +570,7 @@ app.get('/', (req, res) => {
           let img = box.querySelector('img')
           if(!img){ img = document.createElement('img'); img.style.maxWidth='320px'; box.innerHTML=''; box.appendChild(img) }
           img.src = '/wa/qr-img?ts=' + Date.now()
-        } else {}
+        }
       } catch(e){}
     }, 3000)
   </script>
@@ -554,7 +582,7 @@ app.get('/', (req, res) => {
 // ---- startup ----
 ;(async () => {
   try {
-    infoLog(`🔧 Конфигурация: WA_GROUP_ID=${WA_GROUP_ID || ''} WA_GROUP_NAME=${WA_GROUP_NAME || ''}`)
+    infoLog(`🔧 Конфигурация: CONFIG_GROUP_ID=${CONFIG_GROUP_ID || ''} CONFIG_GROUP_NAME=${CONFIG_GROUP_NAME || ''}`)
     await startTelegram()
     await startWhatsApp({ reset: false })
     app.listen(Number(PORT), () => {
