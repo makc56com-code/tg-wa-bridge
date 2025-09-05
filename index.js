@@ -21,8 +21,6 @@ import { Boom } from '@hapi/boom'
 import util from 'util'
 
 // ----------------- NOISY LOGS FILTER -----------------
-// Список подстрок, при наличии которых строка будет подавлена.
-// Добавляйте/убирайте элементы при необходимости.
 const SUPPRESS_PATTERNS = [
   'Closing stale open session',
   'Closing session: SessionEntry',
@@ -37,7 +35,6 @@ const SUPPRESS_PATTERNS = [
   'chainKey: [Object]',
   'messageKeys: {}'
 ]
-
 function shouldSuppressLogLine(s) {
   if (!s) return false
   try {
@@ -47,14 +44,10 @@ function shouldSuppressLogLine(s) {
   } catch (e) {}
   return false
 }
-
-// Backup original consoles
 const _origLog = console.log.bind(console)
 const _origInfo = console.info.bind(console)
 const _origWarn = console.warn.bind(console)
 const _origError = console.error.bind(console)
-
-// Override console.* to filter noisy lines
 ;['log','info','warn','error'].forEach(level => {
   const orig = { log: _origLog, info: _origInfo, warn: _origWarn, error: _origError }[level]
   console[level] = (...args) => {
@@ -63,7 +56,6 @@ const _origError = console.error.bind(console)
       if (shouldSuppressLogLine(s)) return
       orig(s)
     } catch (e) {
-      // if something goes wrong, fall back to original
       orig(...args)
     }
   }
@@ -88,13 +80,33 @@ const {
   LOG_LEVEL
 } = process.env
 
-const CONFIG_GROUP_ID = (WA_GROUP_ID && WA_GROUP_ID.trim()) ? WA_GROUP_ID.trim() : (WHATSAPP_GROUP_ID && WHATSAPP_GROUP_ID.trim() ? WHATSAPP_GROUP_ID.trim() : null)
-const CONFIG_GROUP_NAME = (WA_GROUP_NAME && WA_GROUP_NAME.trim()) ? WA_GROUP_NAME.trim() : (WHATSAPP_GROUP_NAME && WHATSAPP_GROUP_NAME.trim() ? WHATSAPP_GROUP_NAME.trim() : null)
+const CONFIG_GROUP_ID = (WA_GROUP_ID && WA_GROUP_ID.trim()) ? WA_GROUP_ID.trim()
+  : (WHATSAPP_GROUP_ID && WHATSAPP_GROUP_ID.trim() ? WHATSAPP_GROUP_ID.trim() : null)
+const CONFIG_GROUP_NAME = (WA_GROUP_NAME && WA_GROUP_NAME.trim()) ? WA_GROUP_NAME.trim()
+  : (WHATSAPP_GROUP_NAME && WHATSAPP_GROUP_NAME.trim() ? WHATSAPP_GROUP_NAME.trim() : null)
 
 // ---- ensure temp dirs ----
 try { fs.mkdirSync(AUTH_DIR, { recursive: true }) } catch (e) {}
 try { fs.mkdirSync('logs', { recursive: true }) } catch (e) {}
 const LOG_FILE = path.join('logs', 'bridge.log')
+const LOCK_FILE = path.join(AUTH_DIR, '.singleton.lock')
+
+// ---- singleton lock: предотвращаем одновременный запуск ----
+try {
+  // 'wx' — fail if exists
+  const fd = fs.openSync(LOCK_FILE, 'wx')
+  fs.writeSync(fd, `${process.pid}\n${new Date().toISOString()}\n`)
+  fs.closeSync(fd)
+  // on exit, remove lock
+  const cleanupLock = () => { try { fs.rmSync(LOCK_FILE) } catch(e){} }
+  process.on('exit', cleanupLock)
+  process.on('SIGINT', cleanupLock)
+  process.on('SIGTERM', cleanupLock)
+} catch (e) {
+  console.error(chalk.red('❌ Another instance appears to be running (lockfile exists). Exiting to avoid session conflicts.'))
+  console.error(chalk.red(`Lockfile: ${LOCK_FILE}`))
+  process.exit(1)
+}
 
 // ---- logging helpers ----
 function appendLogLine(s) {
@@ -108,7 +120,7 @@ function errorLog(s) { console.error(chalk.red(s)); appendLogLine(s) }
 let tgClient = null
 let sock = null
 let lastQR = null
-let waConnectionStatus = 'disconnected' // connecting, awaiting_qr, connected
+let waConnectionStatus = 'disconnected' // connecting, awaiting_qr, connected, conflict
 let isStartingWA = false
 let saveAuthTimer = null
 let restartTimer = null
@@ -117,10 +129,10 @@ let cachedGroupJid = null
 let lastConflictAt = 0
 let conflictCount = 0
 
-const PLOGGER = P({ level: LOG_LEVEL || 'error' }) // по умолчанию 'error' — минимально
+const PLOGGER = P({ level: LOG_LEVEL || 'error' })
 const UI_DOMAIN = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`
 
-// ---- Gist helpers ----
+// ---- Gist helpers (unchanged) ----
 async function loadAuthFromGistToDir(dir) {
   if (!GITHUB_TOKEN || !GIST_ID) {
     warnLog('GITHUB_TOKEN/GIST_ID not set — skipping Gist load')
@@ -148,12 +160,10 @@ async function loadAuthFromGistToDir(dir) {
     return false
   }
 }
-
 function debounceSaveAuthToGist(dir) {
   if (saveAuthTimer) clearTimeout(saveAuthTimer)
   saveAuthTimer = setTimeout(() => { saveAuthToGist(dir).catch(()=>{}) }, 2500)
 }
-
 async function saveAuthToGist(dir) {
   if (!GITHUB_TOKEN || !GIST_ID) {
     warnLog('GITHUB_TOKEN/GIST_ID not set — skipping Gist save')
@@ -178,7 +188,7 @@ async function saveAuthToGist(dir) {
   }
 }
 
-// ---- Telegram ----
+// ---- Telegram (unchanged) ----
 async function startTelegram() {
   try {
     infoLog('🚀 Подключение к Telegram...')
@@ -191,7 +201,6 @@ async function startTelegram() {
     tgClient = null
   }
 }
-
 async function sendTelegramNotification(text) {
   try {
     if (!tgClient || !TG_SOURCE) return
@@ -200,7 +209,6 @@ async function sendTelegramNotification(text) {
     warnLog('⚠️ Не удалось отправить уведомление в Telegram: ' + (e?.message || e))
   }
 }
-
 async function onTelegramMessage(event) {
   try {
     const message = event.message
@@ -227,17 +235,9 @@ async function onTelegramMessage(event) {
 
 // ---- WhatsApp ----
 function scheduleRestart({ reset = false } = {}) {
-  const now = Date.now()
-  if (now - lastConflictAt < 15_000 && !reset) {
-    infoLog('ℹ️ Недавний conflict — отложим рестарт на 15s')
-    if (restartTimer) return
-    restartTimer = setTimeout(() => { restartTimer = null; scheduleRestart({ reset }) }, 15_000)
-    return
-  }
-
   if (restartTimer) return
   restartCount = Math.min(restartCount + 1, 8)
-  const delay = Math.min(120000, Math.pow(2, restartCount) * 1000)
+  const delay = Math.min(60000, Math.pow(2, restartCount) * 1000)
   infoLog(`ℹ️ Планируем рестарт WA через ${Math.round(delay/1000)}s (reset=${reset}, retryCount=${restartCount})`)
   restartTimer = setTimeout(() => {
     restartTimer = null
@@ -278,12 +278,7 @@ async function startWhatsApp({ reset = false } = {}) {
   }
 
   let version = undefined
-  try {
-    const vinfo = await fetchLatestBaileysVersion()
-    version = vinfo?.version || vinfo?.[0]
-  } catch (e) {
-    warnLog('⚠️ Не удалось получить последнюю версию Baileys, используем дефолтную')
-  }
+  try { version = (await fetchLatestBaileysVersion()).version } catch (e) {}
 
   try {
     sock = makeWASocket({
@@ -322,7 +317,7 @@ async function startWhatsApp({ reset = false } = {}) {
       if (connection === 'open') {
         waConnectionStatus = 'connected'
         restartCount = 0
-        conflictCount = 0 // сбрасываем счётчик конфликтов
+        conflictCount = 0
         infoLog('✅ WhatsApp подключён')
         try { await saveCreds() } catch (e) {}
         debounceSaveAuthToGist(AUTH_DIR)
@@ -339,16 +334,17 @@ async function startWhatsApp({ reset = false } = {}) {
         warnLog('⚠️ WhatsApp соединение закрыто ' + (code || 'unknown'))
         try { await sock?.end?.() } catch (e) {}
 
+        // special handling for 440 / replaced: do NOT aggressively auto-restart
         if (code === 440) {
           lastConflictAt = Date.now()
           conflictCount = (conflictCount || 0) + 1
           warnLog('⚠️ Stream conflict (440). conflictCount=' + conflictCount)
-          if (conflictCount >= 3) {
-            warnLog('❌ Conflict повторился 3 раза — считаем, что сессия заменена. Запрашиваем новый QR (reset=true)')
-            scheduleRestart({ reset: true })
-          } else {
-            scheduleRestart({ reset: false })
-          }
+          waConnectionStatus = 'conflict'
+          // notify operator
+          await sendTelegramNotification(`⚠️ WhatsApp session conflict detected (440). conflictCount=${conflictCount}. Требуется relogin.`).catch(()=>{})
+          // DO NOT schedule immediate restart to avoid tight loop.
+          // Operator should call /wa/relogin to reset session (manual intervention).
+          return
         } else if ([401, 428].includes(code)) {
           warnLog('❌ Сессия недействительна — запустим flow с новой авторизацией (QR)')
           scheduleRestart({ reset: true })
@@ -376,7 +372,7 @@ async function startWhatsApp({ reset = false } = {}) {
   sock.ev.on('connection.error', (err) => { warnLog('⚠️ connection.error: ' + (err?.message || err)) })
 }
 
-// ---- improved cacheGroupId with debug logs and fuzzy matching ----
+// ---- cacheGroupId (unchanged) ----
 function normalizeName(s) {
   if (!s) return ''
   return String(s).replace(/^[\s"'`]+|[\s"'`]+$/g, '').trim().toLowerCase()
@@ -467,7 +463,7 @@ async function sendToWhatsApp(text) {
   }
 }
 
-// ---- HTTP + UI ----
+// ---- HTTP + UI (unchanged except adding /wa/auth-status) ----
 const app = express()
 app.use(express.json())
 
@@ -654,10 +650,12 @@ app.get('/', (req, res) => {
 process.on('SIGINT', async () => {
   infoLog('👋 Завершение...')
   try { await sock?.end?.(); await tgClient?.disconnect?.() } catch (e) {}
+  try { fs.rmSync(LOCK_FILE) } catch(e) {}
   process.exit(0)
 })
 process.on('SIGTERM', async () => {
   infoLog('👋 Завершение...')
   try { await sock?.end?.(); await tgClient?.disconnect?.() } catch (e) {}
+  try { fs.rmSync(LOCK_FILE) } catch(e) {}
   process.exit(0)
 })
