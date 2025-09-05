@@ -1,5 +1,6 @@
 # personal files to ignore
 index.old
+indexold.old
 clean.txt
 init-telegram.ps1
 start-bridge.ps1
