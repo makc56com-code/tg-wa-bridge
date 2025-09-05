@@ -1,17 +1,4 @@
 // index.js
-// Полный рабочий файл — Telegram → WhatsApp мост с хранением сессии в приватном Gist,
-// живым WebUI (кнопки + QR preview), логированием в файл, дебаунсом сохранения и
-// устойчивой логикой переподключения.
-//
-// Перед запуском убедитесь, что в .env заданы:
-// TELEGRAM_API_ID, TELEGRAM_API_HASH, TELEGRAM_STRING_SESSION, TG_SOURCE,
-// WA_GROUP_ID или WA_GROUP_NAME, GITHUB_TOKEN, GIST_ID, ADMIN_TOKEN (для /wa/relogin)
-// и PORT (опционально).
-//
-// Этот файл рассчитан на запуск в контейнере (Render, Heroku и т.п.). Локальный
-// компьютер не участвует — все файлы сессии временно записываются в каталог
-// AUTH_DIR внутри контейнера, но основное хранилище — приватный Gist.
-
 import 'dotenv/config'
 import express from 'express'
 import makeWASocket, {
@@ -32,7 +19,7 @@ import chalk from 'chalk'
 import P from 'pino'
 import { Boom } from '@hapi/boom'
 
-// ---------------- config (from env) ----------------
+// ---- env/config ----
 const {
   TELEGRAM_API_ID,
   TELEGRAM_API_HASH,
@@ -43,16 +30,16 @@ const {
   PORT = 3000,
   GITHUB_TOKEN,
   GIST_ID,
-  AUTH_DIR = '/tmp/auth_info_baileys', // container-local temporary dir
+  AUTH_DIR = '/tmp/auth_info_baileys',
   ADMIN_TOKEN = 'admin-token'
 } = process.env
 
-// ---------------- ensure dirs ----------------
+// ---- ensure temp dirs ----
 try { fs.mkdirSync(AUTH_DIR, { recursive: true }) } catch (e) {}
 try { fs.mkdirSync('logs', { recursive: true }) } catch (e) {}
 const LOG_FILE = path.join('logs', 'bridge.log')
 
-// ---------------- simple file logger + console passthrough ----------------
+// ---- logging helpers ----
 function appendLogLine(s) {
   try { fs.appendFileSync(LOG_FILE, `[${new Date().toISOString()}] ${s}\n`) } catch (e) {}
 }
@@ -60,24 +47,24 @@ function infoLog(s) { console.log(chalk.cyan(s)); appendLogLine(s) }
 function warnLog(s) { console.log(chalk.yellow(s)); appendLogLine(s) }
 function errorLog(s) { console.error(chalk.red(s)); appendLogLine(s) }
 
-// ---------------- globals ----------------
+// ---- globals ----
 let tgClient = null
 let sock = null
 let lastQR = null
 let waConnectionStatus = 'disconnected' // connecting, awaiting_qr, connected
 let isStartingWA = false
 let saveAuthTimer = null
-let retryTimer = null
-let retryCount = 0
+let restartTimer = null
+let restartCount = 0
 let cachedGroupJid = null
 
 const PLOGGER = P({ level: 'warn' })
 const UI_DOMAIN = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`
 
-// ---------------- Gist helpers ----------------
+// ---- Gist helpers ----
 async function loadAuthFromGistToDir(dir) {
   if (!GITHUB_TOKEN || !GIST_ID) {
-    warnLog('GITHUB_TOKEN or GIST_ID not configured — skipping Gist load')
+    warnLog('GITHUB_TOKEN/GIST_ID not set — skipping Gist load')
     return false
   }
   try {
@@ -87,7 +74,7 @@ async function loadAuthFromGistToDir(dir) {
     })
     const files = res.data.files
     if (!files || Object.keys(files).length === 0) {
-      warnLog('Gist empty or no files')
+      warnLog('Gist empty or missing files')
       return false
     }
     fs.mkdirSync(dir, { recursive: true })
@@ -98,7 +85,7 @@ async function loadAuthFromGistToDir(dir) {
     infoLog('📥 Сессия загружена из Gist в ' + dir)
     return true
   } catch (err) {
-    warnLog('⚠️ Ошибка загрузки из Gist: ' + (err?.message || err))
+    warnLog('⚠️ Ошибка загрузки auth из Gist: ' + (err?.message || err))
     return false
   }
 }
@@ -110,7 +97,7 @@ function debounceSaveAuthToGist(dir) {
 
 async function saveAuthToGist(dir) {
   if (!GITHUB_TOKEN || !GIST_ID) {
-    warnLog('GITHUB_TOKEN or GIST_ID not configured — skipping Gist save')
+    warnLog('GITHUB_TOKEN/GIST_ID not set — skipping Gist save')
     return
   }
   try {
@@ -132,7 +119,7 @@ async function saveAuthToGist(dir) {
   }
 }
 
-// ---------------- Telegram ----------------
+// ---- Telegram ----
 async function startTelegram() {
   try {
     infoLog('🚀 Подключение к Telegram...')
@@ -179,44 +166,54 @@ async function onTelegramMessage(event) {
   }
 }
 
-// ---------------- WhatsApp ----------------
-function scheduleRestart(short = false) {
-  if (retryTimer) return
-  retryCount = Math.min(retryCount + 1, 8)
-  const delay = short ? 3000 : Math.min(120000, Math.pow(2, retryCount) * 1000)
-  infoLog(`ℹ️ Планируем рестарт WA через ${Math.round(delay/1000)}s (retryCount=${retryCount})`)
-  retryTimer = setTimeout(() => { retryTimer = null; startWhatsApp({ reset: false }) }, delay)
+// ---- WhatsApp ----
+function scheduleRestart({ reset = false } = {}) {
+  if (restartTimer) return
+  restartCount = Math.min(restartCount + 1, 8)
+  // exponential backoff capped
+  const delay = Math.min(60000, Math.pow(2, restartCount) * 1000)
+  infoLog(`ℹ️ Планируем рестарт WA через ${Math.round(delay/1000)}s (reset=${reset}, retryCount=${restartCount})`)
+  restartTimer = setTimeout(() => {
+    restartTimer = null
+    startWhatsApp({ reset }).catch(e => {
+      warnLog('⚠️ Ошибка при автоматическом рестарте WA: ' + (e?.message || e))
+    })
+  }, delay)
 }
 
 async function startWhatsApp({ reset = false } = {}) {
-  if (isStartingWA) { infoLog('ℹ️ startWhatsApp уже выполняется'); return }
+  if (isStartingWA) {
+    infoLog('ℹ️ startWhatsApp уже выполняется — возвращаемся')
+    return
+  }
   isStartingWA = true
   waConnectionStatus = 'connecting'
   infoLog(`🚀 Запуск WhatsApp... reset=${reset}`)
 
   try { fs.mkdirSync(AUTH_DIR, { recursive: true }) } catch (e) {}
 
-  if (reset) {
+  // if reset is false => try load from Gist; if reset true => skip loading Gist (we want fresh QR)
+  if (!reset) {
+    await loadAuthFromGistToDir(AUTH_DIR).catch(()=>{})
+  } else {
+    // wipe local auth to start fresh flow
     try { fs.rmSync(AUTH_DIR, { recursive: true, force: true }); fs.mkdirSync(AUTH_DIR, { recursive: true }) } catch (e) {}
     lastQR = null
+    infoLog('ℹ️ Подготовлено пустое AUTH_DIR для новой авторизации')
   }
 
-  // Load auth from gist (if exists) into AUTH_DIR. If not present — fresh QR flow.
-  const loaded = await loadAuthFromGistToDir(AUTH_DIR).catch(()=>false)
-  if (!loaded) warnLog('⚠️ Сессия из Gist не найдена — ожидается авторизация через QR')
-
-  // init baileys auth state (will create files if absent)
+  // initialize auth state (will create files if absent)
   let state, saveCreds
   try {
     ({ state, saveCreds } = await useMultiFileAuthState(AUTH_DIR))
   } catch (e) {
     errorLog('❌ useMultiFileAuthState failed: ' + (e?.message || e))
     isStartingWA = false
-    scheduleRestart(false)
+    scheduleRestart({ reset: false })
     return
   }
 
-  // latest baileys version
+  // fetch latest baileys version (optional)
   let version = undefined
   try { version = (await fetchLatestBaileysVersion()).version } catch (e) {}
 
@@ -235,39 +232,38 @@ async function startWhatsApp({ reset = false } = {}) {
   } catch (e) {
     errorLog('❌ makeWASocket failed: ' + (e?.message || e))
     isStartingWA = false
-    scheduleRestart(false)
+    scheduleRestart({ reset: false })
     return
   }
 
-  // when credentials change — save locally (useMultiFileAuthState already writes) and debounce save to gist
+  // creds update -> saveCreds + debounce save to gist
   sock.ev.on('creds.update', async () => {
     try { await saveCreds() } catch (e) {}
     debounceSaveAuthToGist(AUTH_DIR)
   })
 
-  // connection updates
   sock.ev.on('connection.update', async (update) => {
     try {
       const { connection, lastDisconnect, qr } = update
       if (qr) {
         lastQR = qr
         waConnectionStatus = 'awaiting_qr'
-        infoLog('📱 Сгенерирован новый QR (доступен на /wa/qr и WebUI)')
-        // console ASCII
+        infoLog('📱 QR сгенерирован (доступен на /wa/qr и /wa/qr-img)')
         try { qrcodeTerminal.generate(qr, { small: true }) } catch(e){}
         await sendTelegramNotification('⚠️ Новый QR для WhatsApp')
       }
 
       if (connection === 'open') {
         waConnectionStatus = 'connected'
-        retryCount = 0
+        restartCount = 0
         infoLog('✅ WhatsApp подключён')
-        // save auth ASAP (debounced)
+        // persist creds immediately to gist (debounced as well)
+        try { await saveCreds() } catch (e) {}
         debounceSaveAuthToGist(AUTH_DIR)
-        // cache groups
-        try { await cacheGroupId(true) } catch (e) { warnLog('⚠️ cacheGroupId failed: ' + (e?.message||e)) }
-        isStartingWA = false
+        // cache group
+        try { await cacheGroupId(true) } catch (e) { warnLog('⚠️ cacheGroupId failed: ' + (e?.message || e)) }
         lastQR = null
+        isStartingWA = false
       }
 
       if (connection === 'close') {
@@ -275,29 +271,26 @@ async function startWhatsApp({ reset = false } = {}) {
         isStartingWA = false
         let code = null
         try { code = new Boom(lastDisconnect?.error)?.output?.statusCode } catch (e) { code = lastDisconnect?.error?.output?.statusCode || null }
-        warnLog('⚠️ WhatsApp соединение закрыто ' + (code || ''))
-        // clean sock
+        warnLog('⚠️ WhatsApp соединение закрыто ' + (code || 'unknown'))
+        // attempt to close socket
         try { await sock?.end?.() } catch (e) {}
-        // logic:
-        // 401/428 -> session invalid -> restart with reset (new QR)
-        // 409 (conflict) -> do not immediately restart (could be duplicated connection). schedule retry longer.
-        // 440 -> also schedule retry
+        // decision:
         if ([401, 428].includes(code)) {
-          infoLog('❌ Сессия недействительна — стартуем flow с новой авторизацией (QR)')
-          scheduleRestart(true) // short delay then reset
-          // force reset on next start
-          setTimeout(()=> startWhatsApp({ reset: true }), 2000)
+          // invalid credentials -> must do a fresh auth via QR (do NOT reload gist on next attempt)
+          warnLog('❌ Сессия недействительна — запустим flow с новой авторизацией (QR)')
+          scheduleRestart({ reset: true })
         } else if ([409].includes(code)) {
-          warnLog('⚠️ Conflict — не перезапускаем агрессивно. Попробуем позже.')
-          scheduleRestart(true)
+          // conflict - don't spam restarts; schedule gentle retry
+          warnLog('⚠️ Conflict (409) — ожидание, не форсируем рестарт')
+          scheduleRestart({ reset: false })
         } else {
-          scheduleRestart(false)
+          scheduleRestart({ reset: false })
         }
       }
     } catch (e) {
-      errorLog('⚠️ Ошибка connection.update: ' + (e?.message || e))
+      errorLog('⚠️ Ошибка connection.update handler: ' + (e?.message || e))
       isStartingWA = false
-      scheduleRestart(false)
+      scheduleRestart({ reset: false })
     }
   })
 
@@ -311,14 +304,13 @@ async function startWhatsApp({ reset = false } = {}) {
   sock.ev.on('connection.error', (err) => { warnLog('⚠️ connection.error: ' + (err?.message || err)) })
 }
 
-// ---------------- groups + send ----------------
+// ---- groups + send ----
 async function cacheGroupId(sendWelcome=false) {
   try {
-    if (!sock) return
+    if (!sock || waConnectionStatus !== 'connected') { warnLog('WA not connected for group caching'); return }
     const groups = await sock.groupFetchAllParticipating()
     const list = Object.values(groups || {})
-    if (!list.length) { warnLog('⚠️ Учетных групп нет'); cachedGroupJid = null; return }
-    // match by explicit ID or name
+    if (!list.length) { warnLog('⚠️ Нет участников групп'); cachedGroupJid = null; return }
     let target = null
     if (WA_GROUP_ID) {
       const normalized = WA_GROUP_ID.endsWith('@g.us') ? WA_GROUP_ID : (WA_GROUP_ID + '@g.us')
@@ -334,7 +326,7 @@ async function cacheGroupId(sendWelcome=false) {
       }
     } else {
       cachedGroupJid = null
-      warnLog('⚠️ Целевая группа не найдена среди: ' + list.map(g => g.subject + '|' + g.id).join(', '))
+      warnLog('⚠️ Целевая группа не найдена; доступные: ' + list.map(g => `${g.subject}|${g.id}`).join(', '))
     }
   } catch (e) {
     errorLog('❌ Ошибка cacheGroupId: ' + (e?.message || e))
@@ -355,16 +347,14 @@ async function sendToWhatsApp(text) {
   }
 }
 
-// ---------------- HTTP endpoints + WebUI ----------------
+// ---- HTTP + Web UI ----
 const app = express()
 app.use(express.json())
 
 app.get('/ping', (req, res) => res.send('pong'))
 app.get('/healthz', (req, res) => res.status(200).send('ok'))
 
-app.get('/tg/status', (req, res) => {
-  res.send({ telegram: !!tgClient, source: TG_SOURCE || null })
-})
+app.get('/tg/status', (req, res) => res.send({ telegram: !!tgClient, source: TG_SOURCE || null }))
 
 app.post('/tg/send', async (req, res) => {
   const text = req.body.text || req.query.text
@@ -373,12 +363,9 @@ app.post('/tg/send', async (req, res) => {
   try {
     await tgClient.sendMessage(TG_SOURCE, { message: String(text) })
     res.send({ status: 'ok', text })
-  } catch (e) {
-    res.status(500).send({ error: e?.message || e })
-  }
+  } catch (e) { res.status(500).send({ error: e?.message || e }) }
 })
 
-// WA status + UI needs
 app.get('/wa/status', (req, res) => {
   res.send({
     whatsapp: waConnectionStatus,
@@ -388,16 +375,14 @@ app.get('/wa/status', (req, res) => {
 })
 
 app.post('/wa/reset', async (req, res) => {
-  // reset session (wipe local temp, wipe gist entry if desired)
   const token = req.query.token || req.body.token
   if (ADMIN_TOKEN && token !== ADMIN_TOKEN) return res.status(403).send({ error: 'forbidden' })
   try {
     if (sock) try { await sock.logout(); await sock.end() } catch (e) {}
-    try { fs.rmSync(AUTH_DIR, { recursive: true, force: true }) } catch (e) {}
-    lastQR = null
-    cachedGroupJid = null
-    setTimeout(() => startWhatsApp({ reset: true }), 800)
-    res.send({ status: 'ok', message: 'reset started' })
+    try { fs.rmSync(AUTH_DIR, { recursive: true, force: true }); fs.mkdirSync(AUTH_DIR, { recursive: true }) } catch (e) {}
+    lastQR = null; cachedGroupJid = null
+    scheduleRestart({ reset: true })
+    res.send({ status: 'ok', message: 'reset scheduled' })
   } catch (e) { res.status(500).send({ error: e?.message || e }) }
 })
 
@@ -405,46 +390,38 @@ app.post('/wa/relogin', async (req, res) => {
   const token = req.query.token || req.body.token
   if (ADMIN_TOKEN && token !== ADMIN_TOKEN) return res.status(403).send({ error: 'forbidden' })
   try {
-    // trigger re-login (wipe local files and restart flow)
     if (sock) try { await sock.logout(); await sock.end() } catch (e) {}
     try { fs.rmSync(AUTH_DIR, { recursive: true, force: true }); fs.mkdirSync(AUTH_DIR, { recursive: true }) } catch (e) {}
-    lastQR = null
-    cachedGroupJid = null
-    setTimeout(() => startWhatsApp({ reset: true }), 500)
-    res.send({ status: 'ok', message: 'relogin started' })
+    lastQR = null; cachedGroupJid = null
+    scheduleRestart({ reset: true })
+    res.send({ status: 'ok', message: 'relogin scheduled' })
   } catch (e) { res.status(500).send({ error: e?.message || e }) }
 })
 
-// UI trigger (GET) — calls POST with admin token
 app.get('/wa/relogin-ui', (req, res) => {
   const token = ADMIN_TOKEN
-  fetch(`${UI_DOMAIN}/wa/relogin?token=${token}`, { method: 'POST' }).catch(()=>{})
-  res.send(`<html><body><p>Relogin requested. Вернитесь на <a href="/">главную</a>.</p></body></html>`)
+  // fire and forget
+  axios.post(`${UI_DOMAIN}/wa/relogin?token=${token}`).catch(()=>{})
+  res.send(`<html><body><p>Relogin requested. Return to <a href="/">main</a>.</p></body></html>`)
 })
 
 app.get('/wa/qr', async (req, res) => {
-  if (!lastQR) return res.status(404).send('QR не сгенерирован')
+  if (!lastQR) return res.status(404).send('QR not generated')
   try {
     const dataUrl = await QRCode.toDataURL(lastQR, { margin: 1, width: 640 })
-    const html = `<!doctype html><html><body style="display:flex;justify-content:center;align-items:center;height:100vh;background:#071024"><img src="${dataUrl}" /></body></html>`
     res.setHeader('Content-Type', 'text/html; charset=utf-8')
-    res.send(html)
-  } catch (e) {
-    res.status(500).send(e?.message || e)
-  }
+    res.send(`<!doctype html><html><body style="display:flex;align-items:center;justify-content:center;height:100vh;background:#071024"><img src="${dataUrl}" /></body></html>`)
+  } catch (e) { res.status(500).send(e?.message || e) }
 })
 
 app.get('/wa/qr-img', async (req, res) => {
   if (!lastQR) return res.status(404).send('QR not generated')
   try {
-    const buffer = await QRCode.toBuffer(lastQR, { type: 'png', scale: 8 })
+    const buf = await QRCode.toBuffer(lastQR, { type: 'png', scale: 8 })
     res.setHeader('Content-Type', 'image/png')
-    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate')
-    res.send(buffer)
-  } catch (e) {
-    errorLog('QR generation error: ' + (e?.message || e))
-    res.status(500).send('QR generation failed')
-  }
+    res.setHeader('Cache-Control', 'no-store, no-cache')
+    res.send(buf)
+  } catch (e) { res.status(500).send(e?.message || e) }
 })
 
 app.get('/wa/qr-ascii', (req, res) => {
@@ -474,19 +451,23 @@ app.get('/wa/groups', async (req, res) => {
   } catch (e) { res.status(500).send({ error: e?.message || e }) }
 })
 
-// Root WebUI with live QR preview + buttons
+app.get('/logs', (req, res) => {
+  try {
+    const content = fs.existsSync(LOG_FILE) ? fs.readFileSync(LOG_FILE, 'utf8') : ''
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8')
+    res.send(content)
+  } catch (e) { res.status(500).send(e?.message || e) }
+})
+
 app.get('/', (req, res) => {
   const qrPending = !!lastQR
-  const html = `<!doctype html><html><head><meta charset="utf-8" /><title>TG→WA Bridge</title>
+  const html = `<!doctype html><html><head><meta charset="utf-8"/><title>TG→WA Bridge</title>
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <style>
-    body{font-family:Inter,Segoe UI,Roboto,Arial;background:#0f1724;color:#e6eef8;margin:0;padding:24px;display:flex;justify-content:center}
-    .card{max-width:980px;width:100%;background:linear-gradient(180deg, rgba(255,255,255,0.03), rgba(255,255,255,0.01));border-radius:12px;padding:18px}
-    .btn{display:inline-block;margin:6px;padding:10px 14px;border-radius:10px;text-decoration:none;background:#06b6d4;color:#04202a;font-weight:700}
-    .ghost{background:transparent;border:1px solid rgba(255,255,255,0.06);color:#dcecff;padding:10px 14px;border-radius:10px;text-decoration:none}
-    .qr{margin-top:12px}
-  </style>
-  </head><body><div class="card">
+  <style>body{font-family:Inter,Segoe UI,Roboto,Arial;background:#0f1724;color:#e6eef8;margin:0;padding:24px;display:flex;justify-content:center}
+  .card{max-width:980px;width:100%;background:linear-gradient(180deg, rgba(255,255,255,0.03), rgba(255,255,255,0.01));border-radius:12px;padding:18px}
+  .btn{display:inline-block;margin:6px;padding:10px 14px;border-radius:10px;text-decoration:none;background:#06b6d4;color:#04202a;font-weight:700}
+  .ghost{background:transparent;border:1px solid rgba(255,255,255,0.06);color:#dcecff;padding:10px 14px;border-radius:10px;text-decoration:none}
+  .qr{margin-top:12px}</style></head><body><div class="card">
   <h1>🤖 TG → WA Bridge</h1>
   <div>
     <a class="btn" href="/ping" target="_blank">Ping</a>
@@ -498,6 +479,7 @@ app.get('/', (req, res) => {
     <a class="btn" href="/wa/reset?token=${ADMIN_TOKEN}" target="_blank">Reset WA</a>
     <a class="btn" href="/wa/relogin-ui" target="_blank">Relogin WA</a>
     <a class="ghost" href="/wa/qr-ascii" target="_blank">QR ASCII</a>
+    <a class="ghost" href="/logs" target="_blank">Logs</a>
   </div>
   <div style="margin-top:12px">WA: <strong>${waConnectionStatus}</strong> · Telegram: <strong>${tgClient ? 'connected' : 'disconnected'}</strong></div>
   <div class="qr" id="qrbox">${ lastQR ? `<img src="/wa/qr-img?ts=${Date.now()}" style="max-width:320px;"/>` : `<div style="color:#9fb0c8">QR not generated</div>` }</div>
@@ -512,14 +494,9 @@ app.get('/', (req, res) => {
         const box = document.getElementById('qrbox')
         if(pending){
           let img = box.querySelector('img')
-          if(!img){
-            img = document.createElement('img'); img.style.maxWidth='320px'
-            box.innerHTML=''; box.appendChild(img)
-          }
+          if(!img){ img = document.createElement('img'); img.style.maxWidth='320px'; box.innerHTML=''; box.appendChild(img) }
           img.src = '/wa/qr-img?ts=' + Date.now()
-        } else {
-          // no-op (keep last)
-        }
+        } else {}
       } catch(e){}
     }, 3000)
   </script>
@@ -528,22 +505,22 @@ app.get('/', (req, res) => {
   res.send(html)
 })
 
-// ---------------- start ----------------
+// ---- startup ----
 ;(async () => {
   try {
     await startTelegram()
     await startWhatsApp({ reset: false })
     app.listen(Number(PORT), () => {
       infoLog(`🌐 HTTP доступен: ${UI_DOMAIN} (port ${PORT})`)
-      appendLogLine('Available endpoints: /, /ping, /healthz, /tg/status, /tg/send, /wa/status, /wa/groups, /wa/send, /wa/qr, /wa/qr-img, /wa/qr-ascii, /wa/reset, /wa/relogin')
+      appendLogLine('Available endpoints: /, /ping, /healthz, /tg/status, /tg/send, /wa/status, /wa/groups, /wa/send, /wa/qr, /wa/qr-img, /wa/qr-ascii, /wa/reset, /wa/relogin, /logs')
     })
   } catch (e) {
-    errorLog('❌ Ошибка старта сервиса: ' + (e?.message || e))
+    errorLog('❌ Ошибка старта: ' + (e?.message || e))
     process.exit(1)
   }
 })()
 
-// ---------------- graceful shutdown ----------------
+// ---- graceful shutdown ----
 process.on('SIGINT', async () => {
   infoLog('👋 Завершение...')
   try { await sock?.end?.(); await tgClient?.disconnect?.() } catch (e) {}
