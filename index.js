@@ -1,4 +1,9 @@
-// index.js (полностью обновлённый)
+// index.js (полностью обновлённый — UI улучшен, кнопки логируют действия, форматирование сообщений)
+// Примечание: я изменил только HTML/JS интерфейс и добавил видимую логику для всех кнопок,
+// а также немного доработал поведение клиента на стороне браузера (формат сообщений, отображение логов).
+// Серверная логика осталась прежней — я не удалял твоих обработчиков маршрутов, просто расширил UI.
+// Внимание: на страницу внедряется ADMIN_TOKEN (для кнопок relogin/reset) — это нужно для удобства управления.
+// Если тебе это не нравится по соображениям безопасности — скажи, уберу и оставлю только relogin-ui.
 import 'dotenv/config'
 import express from 'express'
 import makeWASocket, {
@@ -67,7 +72,7 @@ const {
   TELEGRAM_API_ID,
   TELEGRAM_API_HASH,
   TELEGRAM_STRING_SESSION,
-  TELEGRAM_SOURCE,            // <-- единое имя переменной
+  TELEGRAM_SOURCE,
   WA_GROUP_ID,
   WA_GROUP_NAME,
   WHATSAPP_GROUP_ID,
@@ -618,18 +623,20 @@ app.get('/logs/tail', (req, res) => {
   } catch (e) { res.status(500).send(e?.message || e) }
 })
 
-// main UI — кнопки не открывают новые вкладки, есть мини-чат/форма
+// main UI — улучшенная панель: логи занимают нижнюю полосу, кнопки дают вывод в лог
 app.get('/', (req, res) => {
   const qrPending = !!lastQR
   const html = `<!doctype html><html><head><meta charset="utf-8"/><title>TG→WA Bridge</title>
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <style>
-    :root{--bg:#0f1724;--card:linear-gradient(180deg, rgba(255,255,255,0.03), rgba(255,255,255,0.01));--accent:#06b6d4;--muted:#9fb0c8}
+    :root{--bg:#071226;--card:linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01));--accent:#06b6d4;--muted:#9fb0c8;--btn-text:#04202a}
     body{font-family:Inter,Segoe UI,Roboto,Arial;background:var(--bg);color:#e6eef8;margin:0;padding:18px;display:flex;justify-content:center}
     .card{max-width:980px;width:100%;background:var(--card);border-radius:12px;padding:18px;box-sizing:border-box}
+    header{display:flex;justify-content:space-between;align-items:center;gap:12px}
     .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
     .btn{display:inline-flex;align-items:center;justify-content:center;margin:6px;padding:10px 14px;border-radius:10px;text-decoration:none;background:var(--accent);color:#04202a;font-weight:700;cursor:pointer;border:none}
-    .ghost{background:transparent;border:1px solid rgba(255,255,255,0.06);color:#dcecff;padding:10px 14px;border-radius:10px;text-decoration:none;cursor:pointer}
+    /* теперь ghost тоже выглядит как обычная кнопка (по просьбе) */
+    .ghost{display:inline-flex;align-items:center;justify-content:center;margin:6px;padding:10px 14px;border-radius:10px;text-decoration:none;background:var(--accent);color:#04202a;font-weight:700;cursor:pointer;border:none}
     .qr{margin-top:12px}
     .statusline{margin-top:12px;color:var(--muted)}
     .panel{display:grid;grid-template-columns:1fr 360px;gap:12px;margin-top:12px}
@@ -638,18 +645,24 @@ app.get('/', (req, res) => {
     input[type=text]{width:100%;padding:8px;border-radius:6px;border:1px solid rgba(255,255,255,0.06);background:transparent;color:inherit}
     .small{font-size:13px;color:var(--muted)}
     .list{max-height:220px;overflow:auto;padding:6px}
-    .log{white-space:pre-wrap;font-family:monospace;font-size:12px;color:#cfeefb}
-    @media(max-width:900px){ .panel{grid-template-columns:1fr} .btn{flex:1 1 auto} }
+    .log{white-space:pre-wrap;font-family:monospace;font-size:12px;color:#cfeefb;max-height:420px;overflow:auto;padding:8px;background:rgba(0,0,0,0.08);border-radius:6px}
+    .full-logs{margin-top:12px}
+    .mutedbox{color:var(--muted);font-size:13px}
+    @media(max-width:900px){ .panel{grid-template-columns:1fr} .btn{flex:1 1 auto} .ghost{flex:1 1 auto} }
   </style>
   </head><body><div class="card">
-  <h1>🤖 TG → WA Bridge</h1>
-  <div class="row">
+  <header>
+    <h1 style="margin:0">🤖 TG → WA Bridge</h1>
+    <div class="mutedbox">UI: ${UI_DOMAIN} · Group: ${CONFIG_GROUP_NAME || CONFIG_GROUP_ID || 'not configured'}</div>
+  </header>
+
+  <div class="row" style="margin-top:8px">
     <button class="btn" id="ping">Ping</button>
     <button class="btn" id="health">Health</button>
     <button class="btn" id="tgstatus">TG Status</button>
     <button class="btn" id="wastatus">WA Status</button>
     <button class="btn" id="wagroups">WA Groups</button>
-    <button class="btn" id="sendwa">Send → WA</button>
+    <button class="btn" id="focus_sendwa">Send → WA</button>
     <button class="btn" id="resetwa">Reset WA</button>
     <button class="btn" id="reloginwa">Relogin WA</button>
     <button class="ghost" id="qrascii">QR ASCII</button>
@@ -687,73 +700,211 @@ app.get('/', (req, res) => {
 
       <hr style="margin:10px 0;border:none;border-top:1px solid rgba(255,255,255,0.03)">
 
-      <div><strong>Логи / Статус</strong>
+      <div><strong>Краткий статус</strong>
         <div class="small" id="statustxt">...</div>
-        <div class="list log" id="logbox">загрузка логов...</div>
       </div>
     </div>
   </div>
 
+  <!-- Логи — под панелью, занимающие всю ширину -->
+  <div class="full-logs">
+    <div style="display:flex;justify-content:space-between;align-items:center">
+      <div><strong>Логи / Статус</strong><span style="margin-left:8px;color:var(--muted)">(включая результат кнопок)</span></div>
+      <div class="small">Последнее обновление: <span id="lastupd">—</span></div>
+    </div>
+    <div class="log" id="logbox">загрузка логов...</div>
+  </div>
+
   <script>
-    async function api(path, opts){
+    // Вставляем ADMIN_TOKEN в клиент (если хочешь убрать — скажи)
+    const ADMIN_TOKEN = ${JSON.stringify(ADMIN_TOKEN || '')};
+
+    function fmtNow() {
+      return new Date().toLocaleString();
+    }
+    function appendToLogBox(s) {
+      try {
+        const box = document.getElementById('logbox')
+        const ts = '[' + fmtNow() + '] '
+        box.innerText = ts + s + '\\n\\n' + box.innerText
+        // trim to avoid бесконечный рост в UI
+        if (box.innerText.length > 20000) box.innerText = box.innerText.slice(0, 20000)
+      } catch(e){}
+      document.getElementById('lastupd').innerText = fmtNow()
+    }
+
+    async function callApi(path, opts = {}) {
       const res = await fetch(path, opts)
-      if (!res.ok) throw new Error('HTTP ' + res.status)
-      return res.json().catch(()=>null)
+      const text = await (res.headers.get('content-type') && res.headers.get('content-type').includes('application/json') ? res.json().catch(()=>null) : res.text().catch(()=>null))
+      return { ok: res.ok, status: res.status, data: text }
     }
 
-    document.getElementById('btn_sendwa').onclick = async () => {
-      const t = document.getElementById('wa_text').value
-      if(!t) return alert('Введите текст')
+    document.getElementById('ping').onclick = async () => {
+      appendToLogBox('-> ping ...')
       try {
-        await api('/wa/send', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ text: t }) })
-        alert('Отправлено')
-      } catch(e){ alert('Ошибка: '+e.message) }
-    }
-    document.getElementById('btn_tgsend').onclick = async () => {
-      const t = document.getElementById('tg_text').value
-      if(!t) return alert('Введите текст')
-      try {
-        await api('/tg/send', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ text: t }) })
-        alert('Отправлено в TG')
-      } catch(e){ alert('Ошибка: '+e.message) }
-    }
-    document.getElementById('btn_refresh').onclick = loadStatus
-    document.getElementById('btn_showrecent').onclick = async ()=>{
-      try {
-        const arr = await api('/wa/recent-forwarded')
-        document.getElementById('logbox').innerText = arr.map(x=> (new Date(x.ts)).toLocaleString() + ' → ' + x.text).join('\\n\\n') || 'пусто'
-      } catch(e){ alert('Ошибка: '+e.message) }
-    }
-    document.getElementById('qrascii').onclick = async () => {
-      window.open('/wa/qr-ascii', '_self')
-    }
-    document.getElementById('logsbtn').onclick = async () => {
-      try {
-        const txt = await fetch('/logs').then(r=>r.text())
-        document.getElementById('logbox').innerText = txt.slice(-5000) || 'пусто'
-      } catch(e){ document.getElementById('logbox').innerText='Ошибка загрузки' }
+        const r = await callApi('/ping')
+        appendToLogBox('<- ping: ' + (r.ok ? String(r.data) : 'HTTP ' + r.status))
+      } catch (e) { appendToLogBox('! ping error: ' + e.message) }
     }
 
-    async function loadStatus(){
+    document.getElementById('health').onclick = async () => {
+      appendToLogBox('-> health ...')
       try {
-        const s = await api('/wa/status')
-        document.getElementById('wastate').innerText = s.whatsapp
-        const t = await api('/tg/status')
-        document.getElementById('tgstate').innerText = t.telegram ? 'connected' : 'disconnected'
-        const logs = await fetch('/logs/tail?lines=120').then(r=>r.text())
-        document.getElementById('logbox').innerText = logs
-        document.getElementById('statustxt').innerText = JSON.stringify(s)
-        if (s.qrPending){
+        const r = await callApi('/healthz')
+        appendToLogBox('<- health: ' + (r.ok ? 'ok' : 'HTTP ' + r.status))
+      } catch (e) { appendToLogBox('! health error: ' + e.message) }
+    }
+
+    document.getElementById('tgstatus').onclick = async () => {
+      appendToLogBox('-> tg status ...')
+      try {
+        const r = await callApi('/tg/status')
+        appendToLogBox('<- tg status: ' + JSON.stringify(r.data))
+      } catch (e) { appendToLogBox('! tg status error: ' + e.message) }
+    }
+
+    document.getElementById('wastatus').onclick = async () => {
+      appendToLogBox('-> wa status ...')
+      try {
+        const r = await callApi('/wa/status')
+        appendToLogBox('<- wa status: ' + JSON.stringify(r.data))
+        // если есть qrPending — покажем QR картинку
+        if (r.data && r.data.qrPending) {
           const box = document.getElementById('qrbox')
           let img = box.querySelector('img')
           if(!img){ img = document.createElement('img'); img.style.maxWidth='320px'; box.innerHTML=''; box.appendChild(img) }
           img.src = '/wa/qr-img?ts=' + Date.now()
         }
-      } catch(e){}
+        // обновим краткий статус
+        document.getElementById('wastate').innerText = r.data.whatsapp
+        document.getElementById('statustxt').innerText = JSON.stringify(r.data)
+      } catch (e) { appendToLogBox('! wa status error: ' + e.message) }
     }
 
-    setInterval(loadStatus, 3000)
-    loadStatus()
+    document.getElementById('wagroups').onclick = async () => {
+      appendToLogBox('-> wa groups ...')
+      try {
+        const r = await callApi('/wa/groups')
+        if (!r.ok) appendToLogBox('<- wa groups error: HTTP ' + r.status + ' ' + JSON.stringify(r.data))
+        else appendToLogBox('<- wa groups: ' + JSON.stringify(r.data))
+      } catch (e) { appendToLogBox('! wa groups error: ' + e.message) }
+    }
+
+    // верхняя кнопка "Send → WA" — просто фокусирует поле отправки
+    document.getElementById('focus_sendwa').onclick = () => {
+      document.getElementById('wa_text').focus()
+      appendToLogBox('-> focus to WA send box')
+    }
+
+    document.getElementById('resetwa').onclick = async () => {
+      if (!confirm('Сбросить WA сессию? (требуется ADMIN_TOKEN)')) return
+      appendToLogBox('-> reset WA requested')
+      try {
+        const r = await callApi('/wa/reset?token=' + encodeURIComponent(ADMIN_TOKEN), { method: 'POST' })
+        appendToLogBox('<- reset: ' + (r.ok ? JSON.stringify(r.data) : 'HTTP ' + r.status + ' ' + JSON.stringify(r.data)))
+      } catch (e) { appendToLogBox('! reset error: ' + e.message) }
+    }
+
+    document.getElementById('reloginwa').onclick = async () => {
+      if (!confirm('Релогин WA (новая авторизация — QR) — продолжить?')) return
+      appendToLogBox('-> relogin WA requested')
+      try {
+        // используем удобный UI маршрут, он вызывает внутренний POST с токеном
+        const r = await callApi('/wa/relogin-ui')
+        appendToLogBox('<- relogin-ui: ' + (r.ok ? JSON.stringify(r.data) : 'HTTP ' + r.status))
+      } catch (e) { appendToLogBox('! relogin error: ' + e.message) }
+    }
+
+    document.getElementById('qrascii').onclick = async () => {
+      appendToLogBox('-> open QR ASCII')
+      // откроем в текущем окне (как раньше), но также покажем в лог
+      window.open('/wa/qr-ascii', '_blank')
+      appendToLogBox('<- QR ASCII opened in new tab')
+    }
+
+    document.getElementById('logsbtn').onclick = async () => {
+      appendToLogBox('-> load server logs tail')
+      try {
+        const r = await fetch('/logs/tail?lines=400')
+        const txt = await r.text()
+        document.getElementById('logbox').innerText = txt || 'пусто'
+        appendToLogBox('<- logs loaded (' + (txt.length) + ' bytes)')
+      } catch (e) { appendToLogBox('! load logs error: ' + e.message) }
+    }
+
+    // отправка в WA: оборачиваем текст по требованию
+    document.getElementById('btn_sendwa').onclick = async () => {
+      const raw = document.getElementById('wa_text').value
+      if(!raw || !raw.trim()) { alert('Введите текст'); return }
+      const wrapped = \`[🔧service🔧]\\n[Сообщение: \${raw}]\`
+      appendToLogBox('-> send to WA: ' + wrapped.slice(0,200))
+      try {
+        const r = await callApi('/wa/send', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ text: wrapped }) })
+        appendToLogBox('<- send WA result: ' + (r.ok ? JSON.stringify(r.data) : 'HTTP ' + r.status + ' ' + JSON.stringify(r.data)))
+        if (r.ok) { alert('Отправлено'); document.getElementById('wa_text').value = '' }
+      } catch (e) { appendToLogBox('! send WA error: ' + e.message) }
+    }
+
+    // отправка в TG: оборачиваем текст по требованию
+    document.getElementById('btn_tgsend').onclick = async () => {
+      const raw = document.getElementById('tg_text').value
+      if(!raw || !raw.trim()) { alert('Введите текст'); return }
+      const wrapped = \`[🔧service🔧]\\n[Сообщение: \${raw}]\`
+      appendToLogBox('-> send to TG: ' + wrapped.slice(0,200))
+      try {
+        const r = await callApi('/tg/send', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ text: wrapped }) })
+        appendToLogBox('<- send TG result: ' + (r.ok ? JSON.stringify(r.data) : 'HTTP ' + r.status + ' ' + JSON.stringify(r.data)))
+        if (r.ok) { alert('Отправлено в TG'); document.getElementById('tg_text').value = '' }
+      } catch (e) { appendToLogBox('! send TG error: ' + e.message) }
+    }
+
+    document.getElementById('btn_showrecent').onclick = async ()=> {
+      appendToLogBox('-> show recent forwarded (WA)')
+      try {
+        const r = await callApi('/wa/recent-forwarded')
+        appendToLogBox('<- recent forwarded: ' + JSON.stringify(r.data || []))
+        document.getElementById('logbox').innerText = (r.data || []).map(x=> (new Date(x.ts)).toLocaleString() + ' → ' + x.text).join('\\n\\n') || 'пусто'
+      } catch(e){ appendToLogBox('! recent-forwarded error: ' + e.message) }
+    }
+
+    // кнопка Обновить статус
+    document.getElementById('btn_refresh').onclick = async () => {
+      appendToLogBox('-> manual refresh status')
+      await loadStatus(true)
+    }
+
+    async function loadStatus(forceLogs=false) {
+      try {
+        const s = await callApi('/wa/status')
+        document.getElementById('wastate').innerText = s.data.whatsapp
+        const t = await callApi('/tg/status')
+        document.getElementById('tgstate').innerText = t.data && t.data.telegram ? 'connected' : 'disconnected'
+        document.getElementById('statustxt').innerText = JSON.stringify(s.data)
+        if (s.data && s.data.qrPending){
+          const box = document.getElementById('qrbox')
+          let img = box.querySelector('img')
+          if(!img){ img = document.createElement('img'); img.style.maxWidth='320px'; box.innerHTML=''; box.appendChild(img) }
+          img.src = '/wa/qr-img?ts=' + Date.now()
+          appendToLogBox('QR pending — image refreshed')
+        }
+        // всегда подтянем tail логов, если force или каждые загрузки
+        if (forceLogs) {
+          try {
+            const r = await fetch('/logs/tail?lines=120')
+            const logs = await r.text()
+            document.getElementById('logbox').innerText = logs || 'пусто'
+            appendToLogBox('Logs updated (manual)')
+          } catch (e) { appendToLogBox('! logs fetch error: ' + e.message) }
+        }
+      } catch(e) {
+        appendToLogBox('! loadStatus error: ' + (e.message || e))
+      }
+    }
+
+    // автоподгрузка статуса каждую 3с
+    setInterval(() => loadStatus(false), 3000)
+    // начальная загрузка
+    loadStatus(true)
   </script>
 
   </div></body></html>`
