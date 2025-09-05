@@ -18,28 +18,29 @@ import chalk from 'chalk'
 import P from 'pino'
 import { Boom } from '@hapi/boom'
 
-// ---------------- Config (env) ----------------
+// ---------------- Config ----------------
 const {
   TELEGRAM_API_ID,
   TELEGRAM_API_HASH,
   TELEGRAM_STRING_SESSION,
-  TG_SOURCE,               // username or id (without @)
-  WA_GROUP_ID,             // either group id (xxxxx@g.us) or group name (case-insensitive) - prefer GROUP_NAME below
-  WA_GROUP_NAME,           // optional: prefer searching by name
+  TG_SOURCE,
+  WA_GROUP_ID,
+  WA_GROUP_NAME,
   PORT = 3000,
   GITHUB_TOKEN,
   GIST_ID,
-  AUTH_DIR = '/tmp/auth_info_baileys' // writable temp dir on Render
+  AUTH_DIR = '/tmp/auth_info_baileys',
+  ADMIN_TOKEN
 } = process.env
 
-// ensure AUTH_DIR exists
-try { fs.mkdirSync(AUTH_DIR, { recursive: true }) } catch (e) { /* ignore */ }
+// Ensure auth dir exists (container-local, ephemeral)
+try { fs.mkdirSync(AUTH_DIR, { recursive: true }) } catch (e) {}
 
 // ---------------- Globals ----------------
 let tgClient = null
 let sock = null
 let lastQR = null
-let waConnectionStatus = 'disconnected' // disconnected | connecting | awaiting_qr | connected
+let waConnectionStatus = 'disconnected'   // disconnected | connecting | awaiting_qr | connected
 let isStartingWA = false
 let needAuthInProgress = false
 let retryCount = 0
@@ -47,10 +48,10 @@ let retryTimer = null
 let saveAuthTimer = null
 let cachedGroupJid = null
 
-const PLOGGER = P({ level: 'warn' }) // pino for Baileys key store
+const PLOGGER = P({ level: 'warn' })
 const UI_DOMAIN = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`
 
-// ---------------- Helpers: Gist load/save ----------------
+// ---------------- Gist helpers ----------------
 async function loadAuthFromGistToDir(dir) {
   if (!GITHUB_TOKEN || !GIST_ID) return false
   try {
@@ -60,10 +61,8 @@ async function loadAuthFromGistToDir(dir) {
     })
     const files = res.data.files
     if (!files || Object.keys(files).length === 0) return false
-
     for (const [filename, fileObj] of Object.entries(files)) {
-      const fp = path.join(dir, filename)
-      fs.writeFileSync(fp, fileObj.content, 'utf8')
+      fs.writeFileSync(path.join(dir, filename), fileObj.content, 'utf8')
     }
     console.log(chalk.green('📥 Auth загружён из Gist в'), dir)
     return true
@@ -83,10 +82,10 @@ async function saveAuthToGist(dir) {
   try {
     if (!fs.existsSync(dir)) return
     const files = {}
-    for (const file of fs.readdirSync(dir)) {
-      const fp = path.join(dir, file)
+    for (const filename of fs.readdirSync(dir)) {
+      const fp = path.join(dir, filename)
       if (!fs.statSync(fp).isFile()) continue
-      files[file] = { content: fs.readFileSync(fp, 'utf8') }
+      files[filename] = { content: fs.readFileSync(fp, 'utf8') }
     }
     if (Object.keys(files).length === 0) return
     await axios.patch(`https://api.github.com/gists/${GIST_ID}`, { files }, {
@@ -113,8 +112,17 @@ async function startTelegram() {
     console.log(chalk.green('✅ Telegram подключён'))
     tgClient.addEventHandler(onTelegramMessage, new NewMessage({}))
   } catch (e) {
-    console.error(chalk.red('❌ Ошибка Telegram:'), e)
+    console.error(chalk.red('❌ Ошибка Telegram:'), e?.message || e)
     tgClient = null
+  }
+}
+
+async function sendTelegramNotification(text) {
+  try {
+    if (!tgClient || !TG_SOURCE) return
+    await tgClient.sendMessage(TG_SOURCE, { message: String(text) })
+  } catch (e) {
+    console.log(chalk.yellow('⚠️ Не удалось отправить уведомление в Telegram:'), e?.message || e)
   }
 }
 
@@ -127,21 +135,22 @@ async function onTelegramMessage(event) {
     const senderUsername = sender?.username ? ('' + sender.username).replace(/^@/,'').toLowerCase() : ''
     const source = (TG_SOURCE || '').toString().replace(/^@/,'').toLowerCase()
     const isFromSource = source && (senderUsername === source || senderIdStr === source || ('-' + senderIdStr) === source)
-    // Only forward textual content from the source
+
     let text = null
     if (message.message && typeof message.message === 'string') text = message.message
     else if (message.message?.message?.conversation) text = message.message.message.conversation
     else if (message.message?.message?.text) text = message.message.message.text
-    if (isFromSource && text && text.toString().trim()) {
-      console.log(chalk.blue('✉️ Получено из TG:'), text.toString().slice(0,200))
-      await sendToWhatsApp(text.toString())
+
+    if (isFromSource && text && String(text).trim()) {
+      console.log(chalk.blue('✉️ Получено из TG:'), String(text).slice(0,200))
+      await sendToWhatsApp(String(text))
     }
-  } catch (e){
-    console.error(chalk.red('⚠️ Ошибка обработки TG event:'), e)
+  } catch (e) {
+    console.error(chalk.red('⚠️ Ошибка обработки TG event:'), e?.message || e)
   }
 }
 
-// ---------------- WhatsApp (Baileys) ----------------
+// ---------------- WhatsApp ----------------
 async function startWhatsApp({ reset = false } = {}) {
   if (isStartingWA) {
     console.log(chalk.gray('ℹ️ startWhatsApp called but isStartingWA=true → skipping'))
@@ -151,169 +160,147 @@ async function startWhatsApp({ reset = false } = {}) {
   waConnectionStatus = 'connecting'
   console.log(chalk.cyan('🚀 Запуск WhatsApp... (reset=' + !!reset + ')'))
 
-  // ensure dir exists
-  try { fs.mkdirSync(AUTH_DIR, { recursive: true }) } catch (e){}
+  try { fs.mkdirSync(AUTH_DIR, { recursive: true }) } catch(e){}
 
   if (reset) {
-    // remove old local files to force new auth
     try { fs.rmSync(AUTH_DIR, { recursive: true, force: true }); fs.mkdirSync(AUTH_DIR, { recursive: true }) } catch(e){}
     lastQR = null
   }
 
-  // try to load from gist into AUTH_DIR
   const loaded = await loadAuthFromGistToDir(AUTH_DIR).catch(()=>false)
   if (!loaded) console.log(chalk.yellow('⚠️ Сессия в Gist не найдена или не загружена — будет новая авторизация.'))
 
-  // ensure dir exists again (useMultiFileAuthState will write files)
-  try { fs.mkdirSync(AUTH_DIR, { recursive: true }) } catch (e){}
-
-  // create auth state and socket
+  // prepare Baileys auth state
   let state, saveCreds
   try {
     ({ state, saveCreds } = await useMultiFileAuthState(AUTH_DIR))
   } catch (e) {
-    console.error(chalk.red('❌ useMultiFileAuthState failed:'), e)
+    console.error(chalk.red('❌ useMultiFileAuthState failed:'), e?.message || e)
     isStartingWA = false
     scheduleRestart(false)
     return
   }
 
-  let version = undefined
-  try { const v = await fetchLatestBaileysVersion(); version = v.version } catch(e){ /* ignore */ }
+  let version
+  try { version = (await fetchLatestBaileysVersion()).version } catch(e){}
 
   try {
     sock = makeWASocket({
       version,
-      auth: {
-        creds: state.creds,
-        keys: makeCacheableSignalKeyStore(state.keys, PLOGGER)
-      },
+      auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, PLOGGER) },
       logger: PLOGGER,
       browser: Browsers.appropriate('Render', 'Chrome'),
       printQRInTerminal: false
     })
   } catch (e) {
-    console.error(chalk.red('❌ makeWASocket failed:'), e)
+    console.error(chalk.red('❌ makeWASocket failed:'), e?.message || e)
     isStartingWA = false
     scheduleRestart(false)
     return
   }
 
-  // Save creds -> debounce -> gist
+  // save credentials -> debounce -> gist
   sock.ev.on('creds.update', async () => {
-    try { await saveCreds() } catch (e){ /* ignore */ }
+    try { await saveCreds() } catch(e){}
     debounceSaveAuthToGist(AUTH_DIR)
   })
 
   // connection updates
   sock.ev.on('connection.update', async (update) => {
     try {
-      const { connection, lastDisconnect, qr, isNewLogin } = update
+      const { connection, lastDisconnect, qr } = update
       if (qr) {
         lastQR = qr
         waConnectionStatus = 'awaiting_qr'
-        console.log(chalk.yellow('📱 QR сгенерирован — открой /qr или WebUI'))
+        console.log(chalk.yellow('📱 QR сгенерирован — открой /wa/qr или WebUI'))
+        // notify TG if possible
+        await sendTelegramNotification('⚠️ Новый QR для WhatsApp — открой WebUI чтобы отсканировать')
       }
       if (connection === 'open') {
         waConnectionStatus = 'connected'
         retryCount = 0
         needAuthInProgress = false
         console.log(chalk.green('✅ WhatsApp подключён'))
-        // sync local files to gist immediately (we likely loaded from gist, but ensure newest saved)
         debounceSaveAuthToGist(AUTH_DIR)
-        // cache groups
-        try { await cacheGroupId(true) } catch(e){ console.log('⚠️ cacheGroupId error:',e?.message||e) }
+        try { await cacheGroupId(true) } catch(e){ console.log('⚠️ cacheGroupId error:', e?.message || e) }
         isStartingWA = false
+        if (retryTimer) { clearTimeout(retryTimer); retryTimer = null }
       } else if (connection === 'close') {
         waConnectionStatus = 'disconnected'
         isStartingWA = false
-        // compute status code more defensively
         let statusCode = null
         try {
           statusCode = new Boom(lastDisconnect?.error)?.output?.statusCode
-        } catch(e){ statusCode = lastDisconnect?.error?.output?.statusCode || null }
+        } catch (e) { statusCode = lastDisconnect?.error?.output?.statusCode || null }
         console.log(chalk.red('⚠️ WhatsApp соединение закрыто'), statusCode || (lastDisconnect?.error && String(lastDisconnect.error).slice(0,150)) || '')
-        // close socket reference safely
-        try { await sock?.end?.() } catch(e) {}
-        // handle specific cases
+        try { await sock?.end?.() } catch(e){}
+
         if (statusCode === 401 || statusCode === 428) {
-          // session invalid/expired; start auth-reset *once* (don't loop)
           if (!needAuthInProgress) {
             needAuthInProgress = true
-            console.log(chalk.yellow('❌ Сессия недействительна — начнём новую авторизацию (generate QR)'))
-            // schedule reset start after small delay to let previous socket close properly
-            setTimeout(()=> startWhatsApp({ reset: true }), 1200)
+            console.log(chalk.yellow('❌ Сессия недействительна — начнём новую авторизацию (QR)'))
+            // small delay to ensure old socket closed cleanly
+            setTimeout(()=> startWhatsApp({ reset: true }), 1100)
           } else {
-            console.log(chalk.gray('ℹ️ already in auth flow; skipping repeated reset'))
+            console.log(chalk.gray('ℹ️ Уже выполняется flow авторизации; пропускаем повторный reset'))
           }
         } else if (statusCode === 440 || statusCode === 409) {
-          // conflict / stream errored — do not force immediate restart => small backoff
+          // conflict/stream error — short backoff
           scheduleRestart(true)
         } else {
-          // generic errors — attempt restart with exponential backoff
           scheduleRestart(false)
         }
       }
     } catch (e) {
-      console.error(chalk.red('⚠️ connection.update handler error:'), e)
+      console.error(chalk.red('⚠️ connection.update handler error:'), e?.message || e)
       isStartingWA = false
       scheduleRestart(false)
     }
   })
 
-  // messages.upsert logging (not used for forwarding here)
   sock.ev.on('messages.upsert', m => {
-    // optional: debug small messages
     const text = m?.messages?.[0]?.message?.conversation || m?.messages?.[0]?.message?.extendedText?.text
     if (text) console.log(chalk.gray('📥 WA msg (preview):'), String(text).slice(0,120))
   })
 
-  // connection error
-  sock.ev.on('connection.error', e => {
-    console.error(chalk.yellow('⚠️ connection.error:'), e?.message || e)
+  sock.ev.on('connection.error', err => {
+    console.error(chalk.yellow('⚠️ connection.error:'), err?.message || err)
   })
 }
 
-// schedule restart with exponential backoff
+// exponential backoff restart scheduler
 function scheduleRestart(isShort=false) {
-  if (retryTimer) return // already scheduled
-  retryCount = Math.min(retryCount + (isShort ? 0 : 1), 6)
-  const delay = isShort ? 3000 : Math.min(60000, Math.pow(2, retryCount) * 1000)
-  console.log(chalk.gray(`ℹ️ Планируем рестарт WhatsApp через ${Math.round(delay/1000)}s (retryCount=${retryCount})`))
+  if (retryTimer) return
+  retryCount = Math.min(retryCount + (isShort ? 0 : 1), 7)
+  const delay = isShort ? 3000 : Math.min(120000, Math.pow(2, retryCount) * 1000)
+  console.log(chalk.gray(`ℹ️ Планируем рестарт WA через ${Math.round(delay/1000)}s (retryCount=${retryCount})`))
   retryTimer = setTimeout(()=> {
     retryTimer = null
     startWhatsApp({ reset: false })
   }, delay)
 }
 
-// ---------------- Groups and sending ----------------
+// ---------------- Groups / Send ----------------
 async function cacheGroupId(sendWelcome=false) {
   try {
     if (!sock) return
     const groups = await sock.groupFetchAllParticipating()
     const list = Object.values(groups || {})
     if (!list.length) return
-    // find by name if provided
     let target = null
-    if (WA_GROUP_ID && WA_GROUP_ID.includes('@g.us')) {
-      target = list.find(g => g.id === WA_GROUP_ID)
-    }
-    if (!target && WA_GROUP_NAME) {
-      target = list.find(g => (g.subject || '').trim().toLowerCase() === WA_GROUP_NAME.trim().toLowerCase())
-    }
-    // fallback: if only one group and WA_GROUP_ID/name not provided, pick first (not ideal)
+    if (WA_GROUP_ID && WA_GROUP_ID.includes('@g.us')) target = list.find(g => g.id === WA_GROUP_ID)
+    if (!target && WA_GROUP_NAME) target = list.find(g => (g.subject||'').trim().toLowerCase() === WA_GROUP_NAME.trim().toLowerCase())
     if (!target && list.length === 1) target = list[0]
     if (target) {
       cachedGroupJid = target.id
-      console.log(chalk.green('✅ Найдена цель группа:'), target.subject, target.id)
+      console.log(chalk.green('✅ Найдена группа:'), target.subject, target.id)
       if (sendWelcome) {
-        const welcome = `[🔧 сервисное сообщение]\n[🌎 подключено]\n[🚨 РАДАР АКТИВЕН 🚨]`
-        try { await sendToWhatsApp(welcome) } catch(e){ console.log('⚠️ Не удалось отправить welcome:', e?.message || e) }
+        try { await sendToWhatsApp('[🔧 сервисное сообщение]\n[🌎 подключено]\n[🚨 РАДАР АКТИВЕН 🚨]') } catch(e){ console.log('⚠️ Не удалось отправить welcome:', e?.message||e) }
       }
     } else {
-      console.log(chalk.yellow('⚠️ Целевая группа не найдена среди участвующих. Список:'))
-      for (const g of list) console.log(' -', g.subject, g.id)
       cachedGroupJid = null
+      console.log(chalk.yellow('⚠️ Целевая группа не найдена; available groups:'))
+      for (const g of list) console.log(' -', g.subject, g.id)
     }
   } catch (e) {
     console.error(chalk.red('❌ Ошибка cacheGroupId:'), e?.message || e)
@@ -322,15 +309,9 @@ async function cacheGroupId(sendWelcome=false) {
 
 async function sendToWhatsApp(text) {
   try {
-    if (!sock || waConnectionStatus !== 'connected') {
-      console.log(chalk.yellow('⏳ WA не готов — сообщение пропущено:'), text?.toString?.().slice(0,120))
-      return false
-    }
+    if (!sock || waConnectionStatus !== 'connected') { console.log(chalk.yellow('⏳ WA не готов — сообщение пропущено')); return false }
     const jid = cachedGroupJid || WA_GROUP_ID
-    if (!jid) {
-      console.log(chalk.red('❌ Нет идентификатора группы для отправки (WA_GROUP_ID/WA_GROUP_NAME не настроены)'))
-      return false
-    }
+    if (!jid) { console.log(chalk.red('❌ Нет идентификатора группы (WA_GROUP_ID/WA_GROUP_NAME не заданы)')); return false }
     const to = jid.includes('@g.us') ? jid : (jid + '@g.us')
     await sock.sendMessage(to, { text: String(text) })
     console.log(chalk.green('➡️ Отправлено в WA:'), String(text).slice(0,120))
@@ -341,13 +322,11 @@ async function sendToWhatsApp(text) {
   }
 }
 
-// ---------------- Web UI & HTTP API ----------------
+// ---------------- HTTP / WebUI ----------------
 const app = express()
 app.use(express.json())
 
-// root UI with buttons and live QR
 app.get('/', (req,res) => {
-  const qrPending = !!lastQR
   const html = `<!doctype html><html><head><meta charset="utf-8"><title>TG→WA Bridge</title>
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <style>body{font-family:sans-serif;background:#0b1220;color:#e6eef8;padding:20px} .card{max-width:980px;margin:0 auto;background:#07102a;padding:18px;border-radius:10px} a.btn{display:inline-block;margin:6px;padding:10px 14px;border-radius:8px;text-decoration:none;background:#06b6d4;color:#04202a;font-weight:700} .qr{margin-top:12px}</style>
@@ -365,10 +344,10 @@ app.get('/ping', (req,res) => res.send('pong'))
 app.get('/healthz', (req,res) => res.status(200).send('ok'))
 
 app.get('/tg/status', (req,res) => res.send({ telegram: !!tgClient, source: TG_SOURCE || null }))
+
 app.post('/tg/send', async (req,res) => {
   const text = req.body.text || req.query.text
   if (!text) return res.status(400).send({ error: 'text required' })
-  // send into TG source (only if bot)
   try {
     if (!tgClient) return res.status(500).send({ error: 'tg not connected' })
     await tgClient.sendMessage((TG_SOURCE||''), { message: String(text) })
@@ -382,22 +361,29 @@ app.get('/wa/status', (req,res) => res.send({
   qrPending: !!lastQR
 }))
 
+// reset/relogin endpoint (requires ADMIN_TOKEN)
+app.post('/wa/relogin', async (req,res) => {
+  const token = req.query.token || req.body.token
+  if (!ADMIN_TOKEN || token !== ADMIN_TOKEN) return res.status(403).send({ error: 'forbidden' })
+  try {
+    needAuthInProgress = false
+    try { fs.rmSync(AUTH_DIR, { recursive: true, force: true }); fs.mkdirSync(AUTH_DIR, { recursive: true }) } catch(e){}
+    if (sock) try { await sock.logout(); await sock.end() } catch(e){}
+    sock = null
+    setTimeout(()=> startWhatsApp({ reset: true }), 800)
+    return res.send({ status:'ok', message:'relogin started (reset=true)' })
+  } catch (e) { console.error(e); return res.status(500).send({ error: e?.message || e }) }
+})
+
 app.all('/wa/reset', async (req,res) => {
   try {
-    // mark needAuthInProgress false to allow reset flow
     needAuthInProgress = false
-    // clear local files & gist? we just reset local and request new auth
     try { fs.rmSync(AUTH_DIR, { recursive: true, force: true }); fs.mkdirSync(AUTH_DIR, { recursive: true }) } catch(e){}
-    if (sock) {
-      try { await sock.logout(); await sock.end() } catch(e){}
-      sock = null
-    }
-    // start with reset to generate new QR
+    if (sock) try { await sock.logout(); await sock.end() } catch(e){}
+    sock = null
     setTimeout(()=> startWhatsApp({ reset: true }), 800)
     return res.send({ status:'ok', message: 'WA reset requested — new QR will be generated' })
-  } catch (e) {
-    console.error(e); return res.status(500).send({ error: e?.message || e })
-  }
+  } catch (e) { console.error(e); return res.status(500).send({ error: e?.message || e }) }
 })
 
 app.post('/wa/send', async (req,res) => {
@@ -419,14 +405,17 @@ app.get('/wa/groups', async (req,res) => {
   } catch (e) { console.error(e); return res.status(500).send({ error: e?.message || e }) }
 })
 
-app.get('/wa/qr-ascii', (req,res) => {
+app.get('/wa/qr-ascii', async (req,res) => {
   if (!lastQR) return res.status(404).send('QR not available yet')
-  // qrcode-terminal is small and sync; require dynamically to reduce bundle
   try {
-    const qrcodeTerminal = await import('qrcode-terminal')
-    const out = qrcodeTerminal.generate(lastQR, { small: true }, q => q)
+    const mod = await import('qrcode-terminal')
+    const gen = mod.generate || mod.default?.generate
+    if (!gen) return res.status(500).send('qrcode-terminal not available')
+    // generate returns via callback; we capture result via callback
+    let outStr = ''
+    gen(lastQR, { small: true }, q => { outStr = q })
     res.setHeader('Content-Type','text/plain; charset=utf-8')
-    return res.send(out)
+    return res.send(outStr)
   } catch (e) {
     return res.status(500).send('Cannot render ascii QR: ' + (e?.message||e))
   }
@@ -453,18 +442,14 @@ app.get('/wa/qr-img', async (req,res) => {
   } catch (e) { res.status(500).send(e?.message||e) }
 })
 
-// ---------------- Start services ----------------
+// ---------------- Start ----------------
 ;(async () => {
-  // start TG and WA in parallel
-  await startTelegram().catch(e=>console.error('tg start error',e))
-  await startWhatsApp({ reset:false }).catch(e=>console.error('wa start error',e))
-
-  app.listen(Number(PORT), () => {
-    console.log(chalk.cyan(`🌐 HTTP доступен: ${UI_DOMAIN} (port ${PORT})`))
-  })
+  await startTelegram().catch(e => console.error('tg start error', e?.message || e))
+  await startWhatsApp({ reset: false }).catch(e => console.error('wa start error', e?.message || e))
+  app.listen(Number(PORT), () => console.log(chalk.cyan(`🌐 HTTP доступен: ${UI_DOMAIN} (port ${PORT})`)))
 })()
 
-// ---------------- Graceful shutdown ----------------
+// ---------------- Shutdown ----------------
 process.on('SIGINT', async () => {
   console.log('👋 Shutdown...')
   try { if (sock) await sock.end(); if (tgClient) await tgClient.disconnect() } catch(e){}
