@@ -235,7 +235,7 @@ async function onTelegramMessage(event) {
 
     if (isFromSource && text && String(text).trim()) {
       infoLog('✉️ Получено из TG: ' + String(text).slice(0,200))
-      await _sendToWAWrapper(String(text))
+      await sendToWhatsApp(String(text))
     } else {
       // логируем непризнанные сообщения для отладки
       if (text && String(text).trim()) {
@@ -453,7 +453,7 @@ async function cacheGroupId(sendWelcome=false) {
       cachedGroupJid = target.id
       infoLog('✅ Закэширован target group: ' + (target.subject || '') + ' (' + target.id + ')')
       if (sendWelcome) {
-        try { await _sendToWAWrapper('[🔧service🔧]\n[🌎подключено🌎]\n[🚨РАДАР АКТИВЕН🚨]\n[🤖автоматический режи🤖]') } catch(e){ warnLog('⚠️ Не удалось отправить welcome: ' + (e?.message||e)) }
+        try { await sendToWhatsApp('[🔧service🔧]\n[🌎подключено🌎]\n[🚨РАДАР АКТИВЕН🚨]\n[🤖автоматический режи🤖]') } catch(e){ warnLog('⚠️ Не удалось отправить welcome: ' + (e?.message||e)) }
       }
     } else {
       cachedGroupJid = null
@@ -465,7 +465,7 @@ async function cacheGroupId(sendWelcome=false) {
 }
 
 // ---- send ----
-async function _sendToWAWrapper(text) {
+async function sendToWhatsApp(text) {
   try {
     if (!sock || waConnectionStatus !== 'connected') { warnLog('⏳ WA не готов — сообщение не отправлено'); return false }
     const jid = cachedGroupJid || (CONFIG_GROUP_ID ? (CONFIG_GROUP_ID.endsWith('@g.us') ? CONFIG_GROUP_ID : CONFIG_GROUP_ID + '@g.us') : null)
@@ -581,7 +581,7 @@ app.post('/wa/send', async (req, res) => {
   const text = req.body.text || req.query.text
   if (!text) return res.status(400).send({ error: 'text required' })
   try {
-    const ok = await _sendToWAWrapper(String(text))
+    const ok = await sendToWhatsApp(String(text))
     if (!ok) return res.status(500).send({ error: 'send failed' })
     res.send({ status: 'ok', text })
   } catch (e) { res.status(500).send({ error: e?.message || e }) }
@@ -607,7 +607,7 @@ app.post('/wa/radar/on', async (req, res) => {
     try { startWhatsApp({ reset: false }).catch(()=>{}) } catch(e){}
     // if connected — send the radar-on message, otherwise the cacheGroupId on connect will send it
     if (waConnectionStatus === 'connected') {
-      await _sendToWAWrapper('[🔧service🔧]\n[🚨РАДАР АКТИВЕН🚨]\n[🤖автоматический режи🤖]')
+      await sendToWhatsApp('[🔧service🔧]\n[🚨РАДАР АКТИВЕН🚨]\n[🤖автоматический режи🤖]')
     }
     res.send({ status: 'ok', radarActive })
   } catch (e) { res.status(500).send({ error: e?.message || e }) }
@@ -621,7 +621,7 @@ app.post('/wa/radar/off', async (req, res) => {
     infoLog('🔕 Radar turned OFF via API')
     // send radar-off message if possible
     if (waConnectionStatus === 'connected') {
-      await _sendToWAWrapper('[🔧service🔧]\n[🚨РАДАР отключен🚨]\n[🤚ручной режим🤚]')
+      await sendToWhatsApp('[🔧service🔧]\n[🚨РАДАР отключен🚨]\n[🤚ручной режим🤚]')
     } else {
       warnLog('WA not connected — radar-off message not sent to group (will send when connected only if specified).')
     }
@@ -1033,20 +1033,7 @@ app.get('/', (req, res) => {
     infoLog(`🔧 Конфигурация: CONFIG_GROUP_ID=${CONFIG_GROUP_ID || ''} CONFIG_GROUP_NAME=${CONFIG_GROUP_NAME || ''} TELEGRAM_SOURCE=${TELEGRAM_SOURCE || ''}`)
     await startTelegram()
     await startWhatsApp({ reset: false })
-    
-
-/* Send service status on startup (RADAR state) */
-(async ()=>{
-  try{
-    const st = radarActive ? '[🔧service🔧]\n[Radar ON]' : '[🔧service🔧]\n[Radar OFF]';
-    if (lastRadarStateLogSent !== (radarActive ? 'on' : 'off')){
-      await sendServiceMessageToWA(st);
-      lastRadarStateLogSent = radarActive ? 'on' : 'off';
-    }
-  }catch(e){ console.error('startup service msg failed', e); }
-})();
-
-app.listen(Number(PORT), () => {
+    app.listen(Number(PORT), () => {
       infoLog(`🌐 HTTP доступен: ${UI_DOMAIN} (port ${PORT})`)
       appendLogLine('Available endpoints: /, /ping, /healthz, /tg/status, /tg/send, /wa/status, /wa/groups, /wa/send, /wa/qr, /wa/qr-img, /wa/qr-ascii, /wa/reset, /wa/relogin, /wa/auth-status, /wa/recent-forwarded, /wa/recent-messages, /logs, /logs/tail, /wa/radar/on, /wa/radar/off, /wa/radar/status')
     })
