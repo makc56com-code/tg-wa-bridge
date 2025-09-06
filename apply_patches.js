@@ -1,306 +1,272 @@
-// apply_ui_radar_patch.js
-// Запуск: node apply_ui_radar_patch.js
-// ВНИМАНИЕ: сделай бэкап проекта заранее
+/**
+ * apply_patch.js
+ * Патчер для index.js (TG→WA bridge)
+ *
+ * Usage:
+ * 1) Place this file in project root (рядом с index.js)
+ * 2) node apply_patch.js
+ *
+ * Создаёт бэкап index.js.bak.<ts> и вносит правки.
+ */
 
 const fs = require('fs');
 const path = require('path');
 
-const ROOT = process.cwd();
-const FILE = path.join(ROOT, 'index.js');
-
-if (!fs.existsSync(FILE)) {
-  console.error('index.js не найден в текущей папке:', FILE);
+const file = path.join(__dirname, 'index.js');
+if (!fs.existsSync(file)) {
+  console.error('ERROR: index.js not found in this folder. Put apply_patch.js into the project root where index.js exists.');
   process.exit(1);
 }
 
-// create backup
-const bak = FILE + '.bak.' + Date.now();
-fs.copyFileSync(FILE, bak);
-console.log('Backup created:', bak);
+const orig = fs.readFileSync(file, 'utf8');
+const backupPath = file + '.bak.' + Date.now();
+fs.writeFileSync(backupPath, orig, 'utf8');
+console.log('Backup created:', backupPath);
 
-let s = fs.readFileSync(FILE, 'utf8');
+let s = orig;
 
-// ------------------- 1) Добавляем переменные состояния рядом с radarActive -------------------
-if (s.indexOf('let radarTestMode') === -1) {
-  s = s.replace(/(let radarActive\s*=.*\n)/, `$1let radarTestMode = false;\nlet lastRadarStateLogSent = null; // 'on'|'off' or null\n`);
-  console.log('Inserted radarTestMode + lastRadarStateLogSent.');
-} else {
-  console.log('radarTestMode already exists — skipped.');
+// safety marker to avoid double-insert
+if (s.includes('// UI_PATCH_MARKER_v1')) {
+  console.log('Patch already applied (marker found). Exiting without changes.');
+  process.exit(0);
 }
 
-// ------------------- 2) Обновляем _sendToWAWrapper чтобы добавлял тест-префикс -------------------
-if (s.indexOf('async function _sendToWAWrapper(text)') !== -1) {
-  s = s.replace(/async function _sendToWAWrapper\([\s\S]*?\n\}\n\n\/\//, match => {
-    // find function body and replace it
-    const newFn = `async function _sendToWAWrapper(text) {
-  try {
-    let finalText = String(text || '');
-    // если включён режим тестирования — добавляем сервисный префикс
-    if (typeof radarTestMode !== 'undefined' && radarTestMode) {
-      finalText = '[🔧service🔧]\\n[🛠режим тестирования🛠]\\n' + finalText;
-    }
-    if (!sock || waConnectionStatus !== 'connected') { warnLog('⏳ WA не готов — сообщение не отправлено'); return false }
-    const jid = cachedGroupJid || (CONFIG_GROUP_ID ? (CONFIG_GROUP_ID.endsWith('@g.us') ? CONFIG_GROUP_ID : CONFIG_GROUP_ID + '@g.us') : null)
-    if (!jid) { errorLog('❌ Нет идентификатора группы для отправки'); return false }
-    await sock.sendMessage(jid, { text: String(finalText) })
-    infoLog('➡️ Отправлено в WA: ' + String(finalText).slice(0, 200))
-    recentForwarded.push({ text: String(finalText), ts: Date.now() })
-    if (recentForwarded.length > MAX_CACHE) recentForwarded.shift()
-    return true
-  } catch (e) {
-    errorLog('❌ Ошибка отправки в WA: ' + (e?.message || e))
-    return false
-  }
-}
+// 1) Insert globals: radarTestMode, pendingServiceMessages, lastRadarStateLogSent, sendServiceMessageToWA
+if (!/let radarTestMode\s*=/.test(s)) {
+  s = s.replace(/(let radarActive\s*=\s*true)/, `$1
 
-//`;
-    return newFn;
-  });
-  console.log('Updated _sendToWAWrapper to add test-mode prefix.');
-} else {
-  console.log('Could not find _sendToWAWrapper signature. Skipping that replacement — manual check required.');
-}
+// UI_PATCH_MARKER_v1
+// radar test & service message helpers (inserted by patch)
+let radarTestMode = false;
+let pendingServiceMessages = [];
+let lastRadarStateLogSent = null;
 
-// ------------------- 3) Добавляем sendServiceMessageToWA helper, если нет -------------------
-if (s.indexOf('async function sendServiceMessageToWA') === -1) {
-  // place helper near top: after AUTH_DIR creation area (finding appendLogLine function area)
-  if (s.indexOf('function appendLogLine') !== -1) {
-    s = s.replace(/(function appendLogLine[\s\S]*?\}\n)/, `$1
 async function sendServiceMessageToWA(text){
+  // unified service message sender — will try immediate send, otherwise queue
   try {
-    // use wrapper so test-mode prefix applies automatically
-    await _sendToWAWrapper(String(text));
+    if (typeof _sendToWAWrapper === 'function') {
+      // try immediate send; _sendToWAWrapper will queue on failure
+      await _sendToWAWrapper(String(text));
+    } else {
+      console.log('[SERVICE->WA]', text);
+      pendingServiceMessages.push(String(text));
+    }
   } catch(e){
-    errorLog('⚠️ sendServiceMessageToWA failed: ' + (e?.message || e));
+    console.error('sendServiceMessageToWA error', e);
+    try{ pendingServiceMessages.push(String(text)) }catch(e2){}
   }
 }
 
 `);
-    console.log('Inserted sendServiceMessageToWA helper.');
-  } else {
-    console.log('Не нашёл место для вставки sendServiceMessageToWA — вставлю в начало файла.');
-    s = `async function sendServiceMessageToWA(text){ try{ await _sendToWAWrapper(String(text)); } catch(e){ console.error(e) } }\n` + s;
-  }
-} else {
-  console.log('sendServiceMessageToWA already present — skipped.');
+  console.log('Inserted radarTestMode/sendServiceMessageToWA globals.');
 }
 
-// ------------------- 4) Гарантированная отправка service msg при toggle radar -------------------
-// Патчим обработчики /wa/radar/on и /wa/radar/off
-s = s.replace(/app\.post\('\/wa\/radar\/on'[\s\S]*?res\.send\(\{ status: 'ok', radarActive \}\)\s*\}\)\s*\/\)/, match => {
-  // find existing handler code and replace with improved version
-  return `app.post('/wa/radar/on', async (req, res) => {
-  const token = req.query.token || req.body.token
-  if (ADMIN_TOKEN && token !== ADMIN_TOKEN) return res.status(403).send({ error: 'forbidden' })
+// 2) Replace _sendToWAWrapper implementation to support:
+//    - queuing when WA disconnected
+//    - sending a separate test-mode service message before the real message (if radarTestMode)
+const wrapperStart = 'async function _sendToWAWrapper(text) {';
+if (s.includes(wrapperStart) && !s.includes('/* patched_send_wrapper_v1 */')) {
+  // find function start index
+  const idx = s.indexOf(wrapperStart);
+  // find end of function by matching braces
+  let i = idx;
+  let braceCount = 0;
+  let started = false;
+  for (; i < s.length; i++) {
+    if (s[i] === '{') { braceCount++; started = true; }
+    else if (s[i] === '}') braceCount--;
+    if (started && braceCount === 0) { i++; break; }
+  }
+  const origFunc = s.slice(idx, i);
+  const newFunc = `/* patched_send_wrapper_v1 */
+async function _sendToWAWrapper(text) {
   try {
-    const interactive = !!req.body.interactive
-    const prev = !!radarActive
-    radarActive = true
-    infoLog('🔔 Radar turned ON via API')
-    try { startWhatsApp({ reset: false }).catch(()=>{}) } catch(e){}
-    // send service message only if state changed or if interactive call forces it
-    if (lastRadarStateLogSent !== 'on' || interactive) {
-      await sendServiceMessageToWA('[🔧service🔧]\\n[🚨РАДАР АКТИВЕН🚨]\\n[🤖автоматический режи🤖]')
-      lastRadarStateLogSent = 'on'
+    // if not connected — queue message for later and return false
+    if (!sock || waConnectionStatus !== 'connected') {
+      warnLog('⏳ WA не готов — сообщение поставлено в очередь');
+      try { pendingServiceMessages.push(String(text)); } catch(e){}
+      return false;
     }
-    res.send({ status: 'ok', radarActive })
-  } catch (e) { res.status(500).send({ error: e?.message || e }) }
-})`;
-});
+    const jid = cachedGroupJid || (CONFIG_GROUP_ID ? (CONFIG_GROUP_ID.endsWith('@g.us') ? CONFIG_GROUP_ID : CONFIG_GROUP_ID + '@g.us') : null);
+    if (!jid) { errorLog('❌ Нет идентификатора группы для отправки'); return false; }
 
-s = s.replace(/app\.post\('\/wa\/radar\/off'[\s\S]*?res\.send\(\{ status: 'ok', radarActive \}\)\s*\}\)\s*\/\)/, match => {
-  return `app.post('/wa/radar/off', async (req, res) => {
-  const token = req.query.token || req.body.token
-  if (ADMIN_TOKEN && token !== ADMIN_TOKEN) return res.status(403).send({ error: 'forbidden' })
-  try {
-    const interactive = !!req.body.interactive
-    const prev = !!radarActive
-    radarActive = false
-    infoLog('🔕 Radar turned OFF via API')
-    if (waConnectionStatus === 'connected') {
-      if (lastRadarStateLogSent !== 'off' || interactive) {
-        await sendServiceMessageToWA('[🔧service🔧]\\n[🚨РАДАР отключен🚨]\\n[🤚ручной режим🤚]')
-        lastRadarStateLogSent = 'off'
+    // If test mode active, send a separate test-mode service message before each forwarded message
+    if (radarTestMode) {
+      try {
+        await sock.sendMessage(jid, { text: '[🔧service🔧]\\n[🛠режим тестирования🛠]' });
+        infoLog('➡️ Отправлено тестовое уведомление (перед сообщением)');
+      } catch(e) {
+        warnLog('⚠️ Не удалось отправить тестовое уведомление — будет поставлено в очередь');
+        try { pendingServiceMessages.push('[🔧service🔧]\\n[🛠режим тестирования🛠]'); } catch(e2){}
       }
-    } else {
-      warnLog('WA not connected — radar-off message not sent to group (will send when connected only if specified).')
     }
-    res.send({ status: 'ok', radarActive })
-  } catch (e) { res.status(500).send({ error: e?.message || e }) }
-})`;
-});
 
-// ------------------- 5) Добавляем endpoints для Radar Test (on/off) -------------------
-if (s.indexOf("app.post('/wa/radar/test/on'") === -1) {
-  const injectPos = s.lastIndexOf('app.get(\'/wa/relogin-ui\'');
-  let inject = `
-/* Radar TEST endpoints */
-app.post('/wa/radar/test/on', async (req, res) => {
-  const token = req.query.token || req.body.token
-  if (ADMIN_TOKEN && token !== ADMIN_TOKEN) return res.status(403).send({ error: 'forbidden' })
-  try {
-    radarTestMode = true
-    infoLog('🔧 Radar TEST mode: ON')
-    await sendServiceMessageToWA('[🔧service🔧]\\n[🛠testON🛠]\\n[🤚ручной режим🤚]')
-    res.send({ ok: true, radarTestMode })
-  } catch (e) { res.status(500).send({ error: e?.message || e }) }
-})
-
-app.post('/wa/radar/test/off', async (req, res) => {
-  const token = req.query.token || req.body.token
-  if (ADMIN_TOKEN && token !== ADMIN_TOKEN) return res.status(403).send({ error: 'forbidden' })
-  try {
-    radarTestMode = false
-    infoLog('🔧 Radar TEST mode: OFF')
-    await sendServiceMessageToWA('[🔧service🔧]\\n[🛠testOFF🛠]\\n🤖автоматический режим🤖')
-    res.send({ ok: true, radarTestMode })
-  } catch (e) { res.status(500).send({ error: e?.message || e }) }
-})
-`;
-  if (injectPos !== -1) {
-    s = s.slice(0, injectPos) + inject + s.slice(injectPos);
-    console.log('Inserted radar test endpoints near /wa/relogin-ui area.');
-  } else {
-    s += inject;
-    console.log('Appended radar test endpoints to end of file.');
-  }
-} else {
-  console.log('Radar test endpoints already present — skipped.');
-}
-
-// ------------------- 6) UI: убрать кнопку "Send → WA" и удалить non-interactive Radar ON/OFF, добавить RadarTest buttons and handlers and password modal -------------------
-// remove the focus_sendwa button by id
-s = s.replace(/<button[^>]*id=["']focus_sendwa["'][\s\S]*?<\/button>\s*/i, '');
-console.log('Removed focus_sendwa button (if present).');
-
-// remove the non-interactive Radar ON/OFF buttons block
-s = s.replace(/<button[^>]*id=["']radarOnBtn["'][\s\S]*?<\/button>\s*<button[^>]*id=["']radarOffBtn["'][\s\S]*?<\/button>/i, '');
-
-// inject RadarTest buttons and client handlers before </body> if not present
-if (s.indexOf('radarTestOnBtn') === -1) {
-  // add two buttons in the small area near Radar toggle: find the toggle-wrap or the closing of that section
-  s = s.replace(/(<\/div>\s*<\/div>\s*<\/div>\s*<\/div>\s*<\/div>\s*<\/script>)/i, match => {
-    // if the file's big, safer to instead inject near where setRadarUi defined
-    return match;
-  });
-
-  // simpler: add buttons into the UI script region where existing radar handlers exist
-  s = s.replace(/(\/\/ RADAR UI handlers[\s\S]*?radarOffBtn\.onclick = async \(\) => {[\s\S]*?}\n\n\s*async function toggleRadar\(on\) {)/, (m) => {
-    // Some index.js does not have radarOffBtn.onclick defined; we'll instead append handlers after toggleRadar implementation.
-    return m + `\n\n    // Radar TEST buttons\n    const radarTestOnBtn = document.getElementById && document.getElementById('radarTestOnBtn');\n    const radarTestOffBtn = document.getElementById && document.getElementById('radarTestOffBtn');\n    if (!radarTestOnBtn && document.querySelector) {\n      // if buttons not in DOM, insert them next to switch\n      try{\n        const wrap = document.querySelector('.toggle-wrap');\n        if (wrap) {\n          const b1 = document.createElement('button'); b1.className='btn'; b1.id='radarTestOnBtn'; b1.innerText='RadarTest ON';\n          const b2 = document.createElement('button'); b2.className='ghost'; b2.id='radarTestOffBtn'; b2.innerText='RadarTest OFF';\n          wrap.parentNode.insertBefore(b1, wrap.nextSibling);\n          wrap.parentNode.insertBefore(b2, wrap.nextSibling);\n        }\n      }catch(e){}\n    }\n    if (typeof document !== 'undefined'){\n      setTimeout(()=>{\n        const tOn = document.getElementById('radarTestOnBtn');\n        const tOff = document.getElementById('radarTestOffBtn');\n        if(tOn) tOn.addEventListener('click', async ()=>{\n          appendToLogBox('-> RadarTest ON');\n          const r = await callApi('/wa/radar/test/on?token=' + encodeURIComponent(ADMIN_TOKEN), { method: 'POST' });\n          appendToLogBox('<- RadarTest ON: ' + JSON.stringify(r.data || r));\n        });\n        if(tOff) tOff.addEventListener('click', async ()=>{\n          appendToLogBox('-> RadarTest OFF');\n          const r = await callApi('/wa/radar/test/off?token=' + encodeURIComponent(ADMIN_TOKEN), { method: 'POST' });\n          appendToLogBox('<- RadarTest OFF: ' + JSON.stringify(r.data || r));\n        });\n      }, 400);\n    }\n\n` + '\n';
-  });
-  console.log('Attempted to inject RadarTest client handlers (if pattern matched).');
-} else {
-  console.log('radarTestOnBtn already present in UI — skipped injection.');
-}
-
-// Also try to directly insert two buttons in HTML near existing toggle area (safer)
-s = s.replace(/(<div class="toggle-wrap"[\s\S]*?<\/div>)/i, (m) => {
-  if (m.indexOf('radarTestOnBtn') !== -1) return m;
-  return m + `\n<div style="display:flex;gap:8px;margin-top:8px">\n  <button class="btn" id="radarTestOnBtn">RadarTest ON</button>\n  <button class="ghost" id="radarTestOffBtn">RadarTest OFF</button>\n</div>`;
-});
-console.log('Inserted RadarTest buttons in HTML (if toggle-wrap found).');
-
-// ------------------- 7) Добавляем UI password middleware and /ui-login endpoint -------------------
-// Insert cookie-parse-less middleware and uiAuth before the main app.get('/') handler.
-// We'll locate the line `app.get('/', (req, res) => {` and replace it with `app.get('/', uiAuth, (req,res)=>{`
-if (s.indexOf('app.post(\'/ui-login\'') === -1) {
-  // insert uiAuth and ui-login handler before the app.get('/') definition
-  const insertPoint = s.indexOf("app.get('/', (req, res) =>");
-  if (insertPoint !== -1) {
-    const authBlock = `
-// Simple UI password-only auth (no external library). Uses ADMIN_PASSWORD env.
-// Parses cookies manually from req.headers.cookie
-function parseCookies(req) {
-  const raw = req.headers && req.headers.cookie;
-  const out = {};
-  if (!raw) return out;
-  raw.split(';').forEach(pair => {
-    const idx = pair.indexOf('=');
-    if (idx === -1) return;
-    const key = pair.slice(0, idx).trim();
-    const val = pair.slice(idx+1).trim();
-    out[key] = decodeURIComponent(val);
-  });
-  return out;
-}
-function uiAuth(req, res, next) {
-  try {
-    if (!process.env.ADMIN_PASSWORD) return next(); // if no password set — allow
-    const cookies = parseCookies(req);
-    if (cookies && cookies.ui_auth === '1') return next();
-    // If AJAX request, return 401
-    if ((req.headers['x-requested-with'] || '').toLowerCase() === 'xmlhttprequest') return res.status(401).send('Unauthorized');
-    // else show simple login page
-    return res.send(`<!doctype html><html><head><meta charset="utf-8"><title>UI Login</title></head><body style="font-family:Arial;padding:24px">
-<h2>Вход в UI</h2>
-<form method="POST" action="/ui-login" id="f">
-  <input name="password" type="password" placeholder="Пароль" style="padding:8px;width:300px"/>
-  <button type="submit" style="padding:8px 12px">Войти</button>
-</form>
-<script>
-document.getElementById('f').addEventListener('submit', async function(e){
-  e.preventDefault();
-  const pwd = this.password.value;
-  const r = await fetch('/ui-login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pwd})});
-  if (r.ok) { location.href = '/'; } else { alert('Неверный пароль'); }
-});
-</script>
-</body></html>`);
+    // send the actual message
+    await sock.sendMessage(jid, { text: String(text) });
+    infoLog('➡️ Отправлено в WA: ' + String(text).slice(0, 200));
+    recentForwarded.push({ text: String(text), ts: Date.now() });
+    if (recentForwarded.length > MAX_CACHE) recentForwarded.shift();
+    return true;
   } catch (e) {
-    return res.status(500).send('Error');
+    errorLog('❌ Ошибка отправки в WA: ' + (e?.message || e));
+    try { pendingServiceMessages.push(String(text)); } catch(e){}
+    return false;
   }
 }
+`;
+  s = s.slice(0, idx) + newFunc + s.slice(i);
+  console.log('Replaced _sendToWAWrapper with patched version (v1).');
+}
 
+// 3) On connection open, flush pendingServiceMessages (insert after cacheGroupId(...) call)
+if (!s.includes('/* flush_pending_service_messages_v1 */')) {
+  s = s.replace(/(try\s*\{\s*await\s+cacheGroupId\([^\)]*\)\s*\}\s*catch\s*\(\s*e\s*\)\s*\{\s*warnLog\([^\}]*\}\s*\))/, `$1
+
+    /* flush_pending_service_messages_v1 */
+    try {
+      if (Array.isArray(pendingServiceMessages) && pendingServiceMessages.length) {
+        infoLog('ℹ️ Flushing queued service messages (' + pendingServiceMessages.length + ') after WA connected');
+        for (const msg of pendingServiceMessages.slice()) {
+          try { await _sendToWAWrapper(msg); } catch(e) { warnLog('⚠️ flush send error: ' + (e?.message||e)) }
+        }
+        pendingServiceMessages.length = 0;
+      }
+    } catch(e){ warnLog('⚠️ flush pending messages failed: ' + (e?.message||e)) }
+`);
+  console.log('Inserted code to flush queued service messages on WA connect.');
+}
+
+// 4) Add endpoints /wa/radar-test/on and /wa/radar-test/off near radar endpoints
+if (!s.includes('/wa/radar-test/on')) {
+  s = s.replace(/(\/\/ RADAR endpoints[\s\S]*?app\.post\('\/wa\/radar\/off'[\s\S]*?\}\)\n\napp\.get\('\/wa\/radar\/status',)/, (m, g1, g2) => {
+    // build insertion
+    const insert = `// Radar test endpoints
+app.post('/wa/radar-test/on', async (req, res) => {
+  const token = req.query.token || req.body.token;
+  if (ADMIN_TOKEN && token !== ADMIN_TOKEN) return res.status(403).send({ error: 'forbidden' });
+  try {
+    radarTestMode = true;
+    infoLog('🔧 Radar TEST turned ON via API');
+    // immediate service message (or queued)
+    await sendServiceMessageToWA('[🔧service🔧]\\n[🛠testON🛠]\\n[🤚ручной режим🤚]');
+    res.send({ status: 'ok', radarTestMode });
+  } catch (e) { res.status(500).send({ error: e?.message || e }) }
+});
+
+app.post('/wa/radar-test/off', async (req, res) => {
+  const token = req.query.token || req.body.token;
+  if (ADMIN_TOKEN && token !== ADMIN_TOKEN) return res.status(403).send({ error: 'forbidden' });
+  try {
+    radarTestMode = false;
+    infoLog('🔧 Radar TEST turned OFF via API');
+    await sendServiceMessageToWA('[🔧service🔧]\\n[🛠testOFF🛠]\\n🤖автоматический режим🤖');
+    res.send({ status: 'ok', radarTestMode });
+  } catch (e) { res.status(500).send({ error: e?.message || e }) }
+});
+
+`;
+    return m + insert + g2;
+  });
+  console.log('Inserted radar-test endpoints.');
+}
+
+// 5) Modify UI HTML
+// 5a) remove top "Send → WA" button (id="focus_sendwa")
+if (s.includes('id="focus_sendwa"')) {
+  s = s.replace(/\s*<button[^>]*id=["']focus_sendwa["'][^>]*>[\s\S]*?<\/button>/i, '');
+  console.log('Removed Send → WA button from HTML.');
+}
+
+// 5b) replace Radar ON/OFF buttons block with RadarTest buttons
+const radarBtnsPattern = /<div style="display:flex;gap:8px;margin-top:8px">\s*<button[^>]*id=["']radarOnBtn["'][\s\S]*?<\/div>/i;
+if (radarBtnsPattern.test(s)) {
+  s = s.replace(radarBtnsPattern, `<div style="display:flex;gap:8px;margin-top:8px">
+          <button class="btn" id="radarTestOnBtn">RadarTest ON</button>
+          <button class="ghost" id="radarTestOffBtn">RadarTest OFF</button>
+        </div>`);
+  console.log('Replaced Radar ON/OFF HTML block with RadarTest buttons.');
+}
+
+// 6) JS: remove focus_sendwa handler (if any)
+s = s.replace(/document\.getElementById\(['"]focus_sendwa['"]\)\.onclick\s*=\s*[^;]+;?/g, '');
+console.log('Removed focus_sendwa JS handler (if existed).');
+
+// 7) Make handlers for radarOnBtn/radarOffBtn safe (existence checks) & add RadarTest handlers
+if (!s.includes('radarTestOnBtn')) {
+  s = s.replace(/const\s+radarOnBtn\s*=\s*document\.getElementById\(['"]radarOnBtn['"]\)\s*;\s*const\s+radarOffBtn\s*=\s*document\.getElementById\(['"]radarOffBtn['"]\)\s*;\s*/s,
+    `const radarOnBtn = document.getElementById('radarOnBtn');
+    const radarOffBtn = document.getElementById('radarOffBtn');
+    if (radarOnBtn) radarOnBtn.onclick = async () => { await toggleRadar(true) }
+    if (radarOffBtn) radarOffBtn.onclick = async () => { await toggleRadar(false) }
+
+    const radarTestOnBtn = document.getElementById('radarTestOnBtn');
+    const radarTestOffBtn = document.getElementById('radarTestOffBtn');
+    if (radarTestOnBtn) {
+      radarTestOnBtn.onclick = async () => {
+        appendToLogBox('-> RadarTest ON');
+        try {
+          const r = await callApi('/wa/radar-test/on?token=' + encodeURIComponent(ADMIN_TOKEN), { method: 'POST' });
+          appendToLogBox('<- radar-test-on: ' + (r.ok ? JSON.stringify(r.data) : 'HTTP ' + r.status));
+        } catch(e){ appendToLogBox('! radar-test-on error: ' + e.message) }
+      };
+    }
+    if (radarTestOffBtn) {
+      radarTestOffBtn.onclick = async () => {
+        appendToLogBox('-> RadarTest OFF');
+        try {
+          const r = await callApi('/wa/radar-test/off?token=' + encodeURIComponent(ADMIN_TOKEN), { method: 'POST' });
+          appendToLogBox('<- radar-test-off: ' + (r.ok ? JSON.stringify(r.data) : 'HTTP ' + r.status));
+        } catch(e){ appendToLogBox('! radar-test-off error: ' + e.message) }
+      };
+    }
+`);
+  console.log('Added safe handlers for radarOn/Off and added RadarTest handlers in UI JS.');
+}
+
+// 8) Add UI password middleware: insert a small route before existing app.get('/', ...) by replacing the first occurrence of "app.get('/', (req, res) => {"
+if (s.includes("app.get('/', (req, res) => {") && !s.includes('/* ui_password_middleware_v1 */')) {
+  s = s.replace("app.get('/', (req, res) => {", `/* ui_password_middleware_v1 */
 app.post('/ui-login', express.json(), (req, res) => {
   try {
-    const pw = req.body && req.body.password;
-    if (!pw) return res.status(400).send({ ok:false });
+    const pw = (req.body && req.body.password) ? String(req.body.password) : '';
+    if (!process.env.ADMIN_PASSWORD) return res.status(500).json({ ok: false, error: 'ADMIN_PASSWORD not set on server' });
     if (pw === process.env.ADMIN_PASSWORD) {
-      // set cookie for UI access; cookie not secure by default (Render uses https)
-      res.setHeader('Set-Cookie', 'ui_auth=1; HttpOnly; Path=/; SameSite=Lax');
-      return res.json({ ok:true });
+      // set cookie (not httpOnly so frontend can set/reload); Path=/ to allow access
+      res.setHeader('Set-Cookie', 'ui_pw=' + encodeURIComponent(pw) + '; Path=/; SameSite=Lax');
+      return res.json({ ok: true });
     }
-    return res.status(401).json({ ok:false });
-  } catch (e) {
-    return res.status(500).json({ ok:false });
-  }
+    return res.status(401).json({ ok: false });
+  } catch (e) { return res.status(500).json({ ok: false, error: e?.message || e }) }
 });
-`;
-    s = s.slice(0, insertPoint) + authBlock + s.slice(insertPoint);
-    // now add uiAuth to the app.get('/') signature (first occurrence)
-    s = s.replace("app.get('/', (req, res) =>", "app.get('/', uiAuth, (req, res) =>");
-    console.log('Inserted uiAuth middleware and /ui-login endpoint and protected /.');
-  } else {
-    console.log('Не удалось найти app.get(/) для вставки uiAuth — пропущено (потребуется ручная правка).');
-  }
-} else {
-  console.log('/ui-login already present — skipped UI auth insertion.');
-}
 
-// ------------------- 8) Ensure startup sends radar service state once -------------------
-// Look for the startup anonymous async block end where startWhatsApp was called earlier
-if (s.indexOf('Send service status on startup') === -1) {
-  // insert a small block right after await startWhatsApp({ reset: false })
-  s = s.replace(/(await startWhatsApp\(\{ reset: false \}\)\s*\)\s*;?\n)/, `$1
-  // send radar status on startup (only once)
-  (async ()=>{
-    try{
-      const st = radarActive ? '[🔧service🔧]\\n[🚨РАДАР АКТИВЕН🚨]\\n[🤖автоматический режи🤖]' : '[🔧service🔧]\\n[🚨РАДАР отключен🚨]\\n[🤚ручной режим🤚]';
-      if (lastRadarStateLogSent !== (radarActive ? 'on' : 'off')) {
-        await sendServiceMessageToWA(st).catch(()=>{});
-        lastRadarStateLogSent = radarActive ? 'on' : 'off';
+app.get('/', (req, res, next) => {
+  try {
+    const pw = process.env.ADMIN_PASSWORD;
+    if (pw) {
+      const cookies = req.headers.cookie || '';
+      const match = cookies.split(';').map(s=>s.trim()).find(s => s.startsWith('ui_pw='));
+      const cookieVal = match ? decodeURIComponent(match.split('=')[1] || '') : null;
+      if (cookieVal !== pw) {
+        // render simple login page if not authorized
+        return res.send(\`<!doctype html><html><head><meta charset="utf-8"><title>Login</title></head><body style="font-family:Arial;padding:20px"><h3>Вход в UI</h3><input id="pwd" type="password" placeholder="Пароль" style="padding:8px" /><button id="btn">Войти</button><div id="err" style="color:red;display:none;margin-top:8px">Неверный пароль</div><script>
+document.getElementById('btn').addEventListener('click', async ()=>{ const pw=document.getElementById('pwd').value; try{ const r=await fetch('/ui-login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})}); if (r.ok) location.reload(); else { document.getElementById('err').style.display='block' } } catch(e){ document.getElementById('err').style.display='block' } });
+</script></body></html>\`);
       }
-    }catch(e){ errorLog('startup service msg failed: ' + (e?.message||e)); }
-  })();
+    }
+  } catch(e){}
+  next();
+});
 
-`);
-  console.log('Inserted startup radar service status block.');
-} else {
-  console.log('Startup radar status block already present — skipped.');
+app.get('/', (req, res) => {`);
+  console.log('Inserted UI password middleware and /ui-login endpoint (login via ADMIN_PASSWORD env).');
 }
 
-// ------------------- write back -------------------
-fs.writeFileSync(FILE, s, 'utf8');
-console.log('Patched index.js saved. Please review the file and test locally before deployment.');
-console.log('If something broke — restore from backup:', bak);
+// 9) final marker
+if (!s.includes('// UI_PATCH_MARKER_v1_END')) {
+  // append closing marker near end (just for safety)
+  s = s.replace(/\)\n\s*app\.listen\(/, `)\n// UI_PATCH_MARKER_v1_END\napp.listen(`);
+}
+
+// write file
+fs.writeFileSync(file, s, 'utf8');
+console.log('Patched index.js written. Please inspect and commit. If something went wrong, restore from backup:', backupPath);
