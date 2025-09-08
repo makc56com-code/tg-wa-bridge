@@ -230,15 +230,13 @@ function parseTelegramMessage(raw) {
       const countMatch = head.match(/Scouts\s*\(?\s*(\d+)\s*\)?/i)
       const cnt = countMatch ? countMatch[1] : null
       taskText = cnt ? `📋 Разведчик(и):[количество не определяеться]: ${cnt} 📋` : ''
-    } const mCnt = head.match(/Monks\s*\(?\s*(\d+)\s*\)?/i)
-    const cnt = mCnt ? mCnt[1] : null
-    lines.push(`📋 Задача: [не определяеться] 📋`)
-    lines.push(`📋 Количество монахов: ${cnt ? cnt : '[не указано]'} 📋`)
-    lines.push(`🗡 Нападает: ${attackerName} ID ${attackerId} из ${fromVillage} 🗡`)
-    lines.push(`🛡 Обороняеться: ${toVillage} ID ${defenderId} 🛡`)
-    if (travelTime) lines.push(`⏰ Время пути: ${travelTime} ⏰`)
-    return lines.join('\n')
-  }
+    } else if (typeRaw.startsWith('monks')) {
+      const countMatch = head.match(/Monks\s*\(?\s*(\d+)\s*\)?/i)
+      const cnt = countMatch ? countMatch[1] : null
+      taskText = cnt ? `📋 Монах(и): ${cnt} 📋` : ''
+    } else {
+      // fallback
+      taskText = ''
     }
   } else {
     const t = taskRaw // e.g. "Attack" or "Ransack[1%]" or "Pillage Stockpile[90%]" or "Gold Raid[50%]" or "Capture" or "Raze"
