@@ -133,6 +133,9 @@ let conflictCount = 0
 // RADAR: по умолчанию активируем, чтобы поведение осталось как раньше (можешь выключить через UI)
 let radarActive = true
 
+// pending service message — если включили/выключили radar когда WA offline, отправим при подключении
+let pendingServiceMessage = null
+
 const PLOGGER = P({ level: LOG_LEVEL || 'error' })
 const UI_DOMAIN = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`
 
@@ -140,6 +143,19 @@ const UI_DOMAIN = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`
 const MAX_CACHE = 200
 const recentForwarded = []     // {text, ts}
 const recentWAMessages = []    // {from, text, ts}
+
+// ---- normalized name cache (optimization) ----
+const _normalizedCache = new Map()
+function normalizeNameCached(s) {
+  if (!s) return ''
+  if (_normalizedCache.has(s)) return _normalizedCache.get(s)
+  const v = String(s).replace(/^[\s"'`]+|[\s"'`]+$/g, '').trim().toLowerCase()
+  _normalizedCache.set(s, v)
+  return v
+}
+function stripNonAlnum(s){
+  return String(s || '').toLowerCase().replace(/[^a-z0-9а-яё]+/gi,'').trim()
+}
 
 // ---- Gist helpers ----
 async function loadAuthFromGistToDir(dir) {
@@ -248,6 +264,23 @@ async function onTelegramMessage(event) {
 }
 
 // ---- WhatsApp ----
+// safe close socket + cleanup listeners
+async function safeCloseSock() {
+  try {
+    if (!sock) return
+    try {
+      // remove listeners to avoid memory leaks / duplicated handlers
+      if (sock.ev && typeof sock.ev.removeAllListeners === 'function') {
+        try { sock.ev.removeAllListeners() } catch(e){}
+      }
+      try { await sock.logout(); } catch(e){}
+      try { await sock.end(); } catch(e){}
+    } catch (e) {}
+  } finally {
+    sock = null
+  }
+}
+
 function scheduleRestart({ reset = false } = {}) {
   if (restartTimer) return
   restartCount = Math.min(restartCount + 1, 8)
@@ -280,6 +313,9 @@ async function startWhatsApp({ reset = false } = {}) {
     lastQR = null
     infoLog('ℹ️ Подготовлено пустое AUTH_DIR для новой авторизации')
   }
+
+  // если есть старая sock — аккуратно закрываем и удаляем listeners
+  try { await safeCloseSock() } catch(e){}
 
   let state, saveCreds
   try {
@@ -336,6 +372,15 @@ async function startWhatsApp({ reset = false } = {}) {
         try { await saveCreds() } catch (e) {}
         debounceSaveAuthToGist(AUTH_DIR)
         try { await cacheGroupId(radarActive) } catch (e) { warnLog('⚠️ cacheGroupId failed: ' + (e?.message || e)) }
+        // если есть отложенное сервисное сообщение — отправим (on/off уведомления)
+        if (pendingServiceMessage && cachedGroupJid) {
+          try {
+            await sendToWhatsApp(pendingServiceMessage)
+            pendingServiceMessage = null
+          } catch (e) {
+            warnLog('⚠️ Не удалось отправить pendingServiceMessage: ' + (e?.message || e))
+          }
+        }
         lastQR = null
         isStartingWA = false
       }
@@ -389,14 +434,6 @@ async function startWhatsApp({ reset = false } = {}) {
 }
 
 // ---- cacheGroupId ----
-function normalizeName(s) {
-  if (!s) return ''
-  return String(s).replace(/^[\s"'`]+|[\s"'`]+$/g, '').trim().toLowerCase()
-}
-function stripNonAlnum(s){
-  return String(s || '').toLowerCase().replace(/[^a-z0-9а-яё]+/gi,'').trim()
-}
-
 async function cacheGroupId(sendWelcome=false) {
   try {
     if (!sock || waConnectionStatus !== 'connected') { warnLog('WA not connected for group caching'); return }
@@ -412,7 +449,7 @@ async function cacheGroupId(sendWelcome=false) {
     const cfgIdRaw = CONFIG_GROUP_ID || null
     const cfgId = cfgIdRaw ? (String(cfgIdRaw).endsWith('@g.us') ? cfgIdRaw : String(cfgIdRaw) + '@g.us') : null
     const cfgNameRaw = CONFIG_GROUP_NAME || null
-    const cfgName = normalizeName(cfgNameRaw)
+    const cfgName = normalizeNameCached(cfgNameRaw)
     infoLog(`🔍 Ищу target by id=${cfgId} name="${cfgNameRaw}" (normalized="${cfgName}")`)
 
     let target = null
@@ -424,24 +461,35 @@ async function cacheGroupId(sendWelcome=false) {
     }
 
     if (!target && cfgName) {
-      target = list.find(g => normalizeName(g.subject) === cfgName)
-      if (target) infoLog(`✅ Найдено по точному имени: "${target.subject}"`)
+      // точное совпадение
+      const exactMatches = list.filter(g => normalizeNameCached(g.subject) === cfgName)
+      if (exactMatches.length === 1) {
+        target = exactMatches[0]
+        infoLog(`✅ Найдено по точному имени: "${target.subject}"`)
+      } else if (exactMatches.length > 1) {
+        // если несколько точных совпадений — логируем и возьмём первый, но предупреждение
+        target = exactMatches[0]
+        warnLog(`⚠️ Несколько точных совпадений при поиске группы по имени: ${exactMatches.map(x=>x.subject).join('; ')} — выбран первый: "${target.subject}"`)
+      }
     }
 
     if (!target && cfgName) {
-      target = list.find(g => normalizeName((g.subject||'')).startsWith(cfgName))
-      if (target) infoLog(`✅ Найдено по startsWith: "${target.subject}"`)
+      const starts = list.filter(g => normalizeNameCached((g.subject||'')).startsWith(cfgName))
+      if (starts.length === 1) { target = starts[0]; infoLog(`✅ Найдено по startsWith: "${target.subject}"`) }
+      else if (starts.length > 1) { target = starts[0]; warnLog(`⚠️ Несколько совпадений startsWith: выбрана первая "${target.subject}"`) }
     }
 
     if (!target && cfgName) {
-      target = list.find(g => normalizeName((g.subject||'')).includes(cfgName))
-      if (target) infoLog(`✅ Найдено по contains: "${target.subject}"`)
+      const includes = list.filter(g => normalizeNameCached((g.subject||'')).includes(cfgName))
+      if (includes.length === 1) { target = includes[0]; infoLog(`✅ Найдено по contains: "${target.subject}"`) }
+      else if (includes.length > 1) { target = includes[0]; warnLog(`⚠️ Несколько совпадений contains: выбрана первая "${target.subject}"`) }
     }
 
     if (!target && cfgName) {
       const wanted = stripNonAlnum(cfgName)
-      target = list.find(g => stripNonAlnum(g.subject) === wanted)
-      if (target) infoLog(`✅ Найдено по stripNonAlnum exact: "${target.subject}"`)
+      const stripped = list.filter(g => stripNonAlnum(g.subject) === wanted)
+      if (stripped.length === 1) { target = stripped[0]; infoLog(`✅ Найдено по stripNonAlnum exact: "${target.subject}"`) }
+      else if (stripped.length > 1) { target = stripped[0]; warnLog(`⚠️ Несколько совпадений stripNonAlnum: выбрана первая "${target.subject}"`) }
     }
 
     if (!target && list.length === 1) {
@@ -452,8 +500,11 @@ async function cacheGroupId(sendWelcome=false) {
     if (target) {
       cachedGroupJid = target.id
       infoLog('✅ Закэширован target group: ' + (target.subject || '') + ' (' + target.id + ')')
-      if (sendWelcome) {
+      if (sendWelcome && radarActive) {
         try { await sendToWhatsApp('[🔧service🔧]\n[🌎подключено🌎]\n[🚨РАДАР АКТИВЕН🚨]') } catch(e){ warnLog('⚠️ Не удалось отправить welcome: ' + (e?.message||e)) }
+      } else if (sendWelcome && pendingServiceMessage) {
+        // если есть pending message — отправим её (редкий кейс)
+        try { await sendToWhatsApp(pendingServiceMessage); pendingServiceMessage = null } catch(e){ warnLog('⚠️ Не удалось отправить pendingServiceMessage после кеширования группы: ' + (e?.message||e)) }
       }
     } else {
       cachedGroupJid = null
@@ -524,7 +575,8 @@ app.post('/wa/reset', async (req, res) => {
   const token = req.query.token || req.body.token
   if (ADMIN_TOKEN && token !== ADMIN_TOKEN) return res.status(403).send({ error: 'forbidden' })
   try {
-    if (sock) try { await sock.logout(); await sock.end() } catch (e) {}
+    // аккуратно закрываем старую сессию и очищаем listeners
+    try { await safeCloseSock() } catch (e) { warnLog('⚠️ safeCloseSock failed during reset: ' + (e?.message || e)) }
     try { fs.rmSync(AUTH_DIR, { recursive: true, force: true }); fs.mkdirSync(AUTH_DIR, { recursive: true }) } catch (e) {}
     lastQR = null; cachedGroupJid = null
     scheduleRestart({ reset: true })
@@ -536,7 +588,7 @@ app.post('/wa/relogin', async (req, res) => {
   const token = req.query.token || req.body.token
   if (ADMIN_TOKEN && token !== ADMIN_TOKEN) return res.status(403).send({ error: 'forbidden' })
   try {
-    if (sock) try { await sock.logout(); await sock.end() } catch (e) {}
+    try { await safeCloseSock() } catch (e) { warnLog('⚠️ safeCloseSock failed during relogin: ' + (e?.message || e)) }
     try { fs.rmSync(AUTH_DIR, { recursive: true, force: true }); fs.mkdirSync(AUTH_DIR, { recursive: true }) } catch (e) {}
     lastQR = null; cachedGroupJid = null
     scheduleRestart({ reset: true })
@@ -603,11 +655,15 @@ app.post('/wa/radar/on', async (req, res) => {
   try {
     radarActive = true
     infoLog('🔔 Radar turned ON via API')
+    const msg = '[🔧service🔧]\n[🌎подключено🌎]\n[🚨РАДАР АКТИВЕН🚨]'
     // try to ensure WA is running
     try { startWhatsApp({ reset: false }).catch(()=>{}) } catch(e){}
-    // if connected — send the radar-on message, otherwise the cacheGroupId on connect will send it
+    // if connected — send the radar-on message, otherwise store pendingServiceMessage to send on connect
     if (waConnectionStatus === 'connected') {
-      await sendToWhatsApp('[🔧service🔧]\n[🌎подключено🌎]\n[🚨РАДАР АКТИВЕН🚨]')
+      await sendToWhatsApp(msg)
+    } else {
+      pendingServiceMessage = msg
+      infoLog('ℹ️ WA not connected — pendingServiceMessage saved (will send on next connect)')
     }
     res.send({ status: 'ok', radarActive })
   } catch (e) { res.status(500).send({ error: e?.message || e }) }
@@ -619,11 +675,13 @@ app.post('/wa/radar/off', async (req, res) => {
   try {
     radarActive = false
     infoLog('🔕 Radar turned OFF via API')
-    // send radar-off message if possible
+    const msg = '[🔧service🔧]\n[🚨РАДАР отключен🚨]\n[🤚ручной режим🤚]'
+    // send radar-off message if possible, otherwise save pending message
     if (waConnectionStatus === 'connected') {
-      await sendToWhatsApp('[🔧service🔧]\n[🚨РАДАР отключен🚨]\n[🤚ручной режим🤚]')
+      await sendToWhatsApp(msg)
     } else {
-      warnLog('WA not connected — radar-off message not sent to group (will send when connected only if specified).')
+      pendingServiceMessage = msg
+      warnLog('WA not connected — radar-off message saved to send on next connect.')
     }
     res.send({ status: 'ok', radarActive })
   } catch (e) { res.status(500).send({ error: e?.message || e }) }
@@ -753,7 +811,7 @@ app.get('/', (req, res) => {
 
         <!-- Radar toggle -->
         <div class="toggle-wrap">
-          <div id="radarSwitch" class="switch" title="Toggle Radar"></div>
+          <div id="radarSwitch" class="switch" title="Toggle Radar"><div class="knob"></div></div>
           <div>
             <div style="font-weight:700" id="radarLabel">RADAR</div>
             <div class="small" id="radarSub">загрузка...</div>
@@ -802,6 +860,17 @@ app.get('/', (req, res) => {
       return { ok: res.ok, status: res.status, data: text }
     }
 
+    // helper: enable/disable WA-related controls based on connected state
+    function setWAControlsEnabled(enabled) {
+      try {
+        document.getElementById('btn_sendwa').disabled = !enabled
+        document.getElementById('wa_text').disabled = !enabled
+        // radar controls still work even when WA disconnected (they'll set pending message)
+        document.getElementById('radarOnBtn').disabled = false
+        document.getElementById('radarOffBtn').disabled = false
+      } catch(e){}
+    }
+
     document.getElementById('ping').onclick = async () => {
       appendToLogBox('-> ping ...')
       try {
@@ -843,6 +912,8 @@ app.get('/', (req, res) => {
         document.getElementById('statustxt').innerText = JSON.stringify(r.data)
         // radar flag
         setRadarUi(!!r.data.radarActive)
+        // enable/disable controls depending on wa connection
+        setWAControlsEnabled(r.data.whatsapp === 'connected')
       } catch (e) { appendToLogBox('! wa status error: ' + e.message) }
     }
 
@@ -1002,6 +1073,8 @@ app.get('/', (req, res) => {
         }
         // update radar UI
         setRadarUi(!!(s.data && s.data.radarActive))
+        // enable/disable WA controls (so user doesn't try to send when disconnected)
+        setWAControlsEnabled(s.data.whatsapp === 'connected')
         // always pull logs if forced
         if (forceLogs) {
           try {
@@ -1046,13 +1119,13 @@ app.get('/', (req, res) => {
 // ---- graceful shutdown ----
 process.on('SIGINT', async () => {
   infoLog('👋 Завершение...')
-  try { await sock?.end?.(); await tgClient?.disconnect?.() } catch (e) {}
+  try { await safeCloseSock(); await tgClient?.disconnect?.() } catch (e) {}
   try { fs.rmSync(LOCK_FILE) } catch(e) {}
   process.exit(0)
 })
 process.on('SIGTERM', async () => {
   infoLog('👋 Завершение...')
-  try { await sock?.end?.(); await tgClient?.disconnect?.() } catch (e) {}
+  try { await safeCloseSock(); await tgClient?.disconnect?.() } catch (e) {}
   try { fs.rmSync(LOCK_FILE) } catch(e) {}
   process.exit(0)
 })
