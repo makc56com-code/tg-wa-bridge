@@ -1,7 +1,7 @@
 // index.js (полностью обновлённый — UI и логика Radar включены)
 // Я внёс минимальные изменения в остальную логику: добавил флаг radarActive, эндпоинты для включения/выключения радара,
 // UI-кнопки и поправил CSS для "Краткий статус", чтобы ничего не вылазило за границы.
-// Всё остальное — оригинальный код с небольшими адаптациями (отправка welcome только если radarActive).
+// Теперь добавлен парсер сообщений из Telegram (форматирование и отправка в WA).
 import 'dotenv/config'
 import express from 'express'
 import makeWASocket, {
@@ -159,15 +159,8 @@ function stripNonAlnum(s){
 
 // ----------------- PARSER: Telegram -> formatted WA message -----------------
 /**
- * parseTelegramMessage(raw)
+ * parseTelegramMessage(rawText)
  * возвращает строку (готовую к отправке в WA) или null если не парсится
- *
- * Правила:
- * - Убираем префикс [Global Realm N]
- * - Парсим head (тип + (задача)) и tail (From[...]...[id] fromVillage to [defId] toVillage | time)
- * - Для Scouts: если сервер присылает 1 — отображаем "[кол-во не определено]"
- * - Для Monks: задача всегда "📋 Задача: [не определяеться]" и выводим "📋 Количество монахов: N"
- * - Для остальных типов — соответствующие эмодзи и вставка процентов, если есть (например [90%])
  */
 function parseTelegramMessage(raw) {
   if (!raw || typeof raw !== 'string') return null
@@ -179,38 +172,45 @@ function parseTelegramMessage(raw) {
   // 2) найдем позицию From[ — всё до неё содержит тип и (задачу)
   const fromIdx = msg.indexOf('From[')
   if (fromIdx === -1) {
+    // Иногда исходный текст может отличаться — вернём null, чтобы сохранить оригинал
     return null
   }
-  const head = msg.slice(0, fromIdx).trim() // e.g. "Attack (Attack)" or "Captain (Pillage Stockpile[90%])" or "Scouts (1)"
-  const tail = msg.slice(fromIdx).trim() // starting with "From[...]" to end, contains time after '|'
+  const head = msg.slice(0, fromIdx).trim() // например "Attack (Attack)" или "Captain (Pillage Stockpile[90%])" или "Scouts (1)"
+  const tail = msg.slice(fromIdx).trim() // начиная с "From[...]" до конца, содержит также time после '|'
 
   // 3) извлечём задачу в скобках, если есть
   const taskMatch = head.match(/\(([^)]+)\)/)
   const taskRaw = taskMatch ? taskMatch[1].trim() : null
 
   // 4) извлечём основной тип (например Attack, Captain, Scouts, Monks, Attack to Capital, Scouts to Capital, Monks to Capital)
-  const typeRaw = head.replace(/\([^)]+\)/, '').trim()
+  const typeRaw = head.replace(/\([^)]+\)/, '').trim().toLowerCase()
 
-  // 5) map type to header
+  // 5) применим отображения типов в заголовок
   function mapTypeToHeader(t) {
     if (!t) return '⚔ СООБЩЕНИЕ ⚔'
-    const s = String(t).toLowerCase()
+    const s = t.toLowerCase()
     if (s.startsWith('captain')) return '⚔ ВНИМАНИЕ КАПИТАН ⚔'
-    if (s.includes('attack to capital') || s.startsWith('attack to capital')) return '⚔ ВНИМАНИЕ АТАКА НА ГОРОД ⚔'
+    if (s.startsWith('attack to capital') || s.includes('attack to capital')) return '⚔🌆 ВНИМАНИЕ АТАКА НА ГОРОД 🌃⚔'
     if (s.startsWith('attack')) return '⚔ ВНИМАНИЕ АРМИЯ ⚔'
-    if (s.includes('scouts to capital') || s.startsWith('scouts to capital')) return '🐎 РАЗВЕДКА ГОРОДА🐎'
+    if (s.startsWith('scouts to capital') || s.includes('scouts to capital')) return '🐎🌆 РАЗВЕДКА ГОРОДА 🌃🐎'
     if (s.startsWith('scouts')) return '🐎 РАЗВЕДКА 🐎'
-    if (s.includes('monks to capital') || s.startsWith('monks to capital')) return '☦ МОНАХ В ГОРОД ☦'
+    if (s.startsWith('monks to capital') || s.includes('monks to capital')) return '☦🌆 МОНАХ ПРИБЫВАЕТ В ГОРОД 🌃☦'
     if (s.startsWith('monks')) return '☦ МОНАХ ☦'
     return '⚔ СООБЩЕНИЕ ⚔'
   }
   const header = mapTypeToHeader(typeRaw)
 
-  // 6) Разбор tail: From[Name][Id] <fromVillage> to [DefId] <toVillage> | time
+  // 6) разобъём tail: From[AttackerName][AttackerId] <fromVillage> to [DefId] <toVillage> | time
+  // пример tail: From[СексКАМАЗ][25460] 01 УБ Дрочильня to [105065] 2 Проток Дерьма| 00:04:23
+  // regex позволит захватить группы аккуратно
   const tailRegex = /From\[(.*?)\]\[(\d+)\]\s+(.+?)\s+to\s+\[(\d+)\]\s+(.+?)(?:\s*\|\s*([0-9]{2}:[0-9]{2}:[0-9]{2}))?$/i
   const tailMatch = tail.match(tailRegex)
   if (!tailMatch) {
-    // если шаблон не подошёл — пробуем вытянуть время в конце, но в общем — возвращаем null
+    // если основной шаблон не подошёл — попытаемся вытащить время и части альтернативно
+    // попробуем найти time в конце
+    const timeAlt = msg.match(/([0-9]{2}:[0-9]{2}:[0-9]{2})\s*$/)
+    const timeStr = timeAlt ? timeAlt[1] : ''
+    // попроще — не парсим, отдаём null чтобы не ломать поток
     return null
   }
 
@@ -221,104 +221,74 @@ function parseTelegramMessage(raw) {
   const toVillage = (tailMatch[5] || '').trim()
   const travelTime = (tailMatch[6] || '').trim()
 
-  // 7) Формируем taskText и специальные поля в зависимости от type/taskRaw
-  let lines = []
-  lines.push(header)
-
-  const lowTask = taskRaw ? taskRaw.toLowerCase() : null
-  const lowType = typeRaw ? typeRaw.toLowerCase() : ''
-
-  // Helper: extract percent/qty inside brackets like [90%] or [1%]
-  function extractBracketPart(s) {
-    if (!s) return null
-    const m = s.match(/\[([^\]]+)\]/)
-    return m ? `[${m[1]}]` : null
-  }
-
-  if (lowType.startsWith('scouts')) {
-    // Scouts: server often sends "(1)" — that means unknown real count
-    // try to extract number from head parentheses (if present), else fallback to null
-    let cnt = null
-    const mCnt = head.match(/Scouts\s*\(?\s*(\d+)\s*\)?/i)
-    if (mCnt) cnt = parseInt(mCnt[1], 10)
-    // if server gave 1 => we must show "[кол-во не определено]"
-    const cntDisplay = (cnt === 1 || cnt === null) ? '[кол-во не определено]' : String(cnt)
-    lines.push(`📋 Разведчик(и): ${cntDisplay} 📋`)
-    lines.push(`🗡 Нападает: ${attackerName} ID ${attackerId} из ${fromVillage} 🗡`)
-    lines.push(`🛡 Обороняеться: ${toVillage} ID ${defenderId} 🛡`)
-    if (travelTime) lines.push(`⏰ Время пути: ${travelTime} ⏰`)
-    return lines.join('\n')
-  }
-
-  if (lowType.includes('scouts to capital')) {
-    // Scouts to Capital: same handling as scouts, but header already adjusted
-    let cnt = null
-    const mCnt = head.match(/Scouts\s*\(?\s*(\d+)\s*\)?/i)
-    if (mCnt) cnt = parseInt(mCnt[1], 10)
-    const cntDisplay = (cnt === 1 || cnt === null) ? '[кол-во не определено]' : String(cnt)
-    lines.push(`📋 Разведчик(и): ${cntDisplay} 📋`)
-    lines.push(`🗡 Нападает: ${attackerName} ID ${attackerId} из ${fromVillage} 🗡`)
-    lines.push(`🛡 Обороняеться: ${toVillage} ID ${defenderId} 🛡`)
-    if (travelTime) lines.push(`⏰ Время пути: ${travelTime} ⏰`)
-    return lines.join('\n')
-  }
-
-  if (lowType.startsWith('monks') || lowType.includes('monks to capital')) {
-    // Monks: task is not provided by server; show [не определяеться] and show count if present
-    const mCnt = head.match(/Monks\s*\(?\s*(\d+)\s*\)?/i)
-    const cnt = mCnt ? mCnt[1] : null
-    lines.push(`📋 Задача: [не определяеться] 📋`)
-    lines.push(`📋 Количество монахов: ${cnt ? cnt : '[не указано]'} 📋`)
-    lines.push(`🗡 Нападает: ${attackerName} ID ${attackerId} из ${fromVillage} 🗡`)
-    lines.push(`🛡 Обороняеться: ${toVillage} ID ${defenderId} 🛡`)
-    if (travelTime) lines.push(`⏰ Время пути: ${travelTime} ⏰`)
-    return lines.join('\n')
-  }
-
-  // For army/captain/attack-type messages: produce taskText per taskRaw
+  // 7) сформируем строку "задачи" (taskText) по входному taskRaw
+  let taskText = ''
   if (!taskRaw) {
-    // fallback — no task specified
-    lines.push(`📋 Задача: [не указана] 📋`)
-  } else {
-    // interpret taskRaw values
-    if (lowTask === 'attack') {
-      lines.push('📋 Задача: РАЗРУШЕНИЕ 📋')
-    } else if (lowTask.startsWith('ransack')) {
-      const pct = extractBracketPart(taskRaw)
-      lines.push(`📋 Задача: 🔥 ПОДЖЕГ 🔥${pct ? ' кол-во построек: ' + pct : ''} 📋`)
-    } else if (lowTask.startsWith('pillage stockpile')) {
-      const pct = extractBracketPart(taskRaw)
-      lines.push(`📋 Задача: 🪨🌳 ГРАБЕЖ СКЛАДА 🌳🪨${pct ? ' кол-во: ' + pct : ''} 📋`)
-    } else if (lowTask.startsWith('pillage granary')) {
-      const pct = extractBracketPart(taskRaw)
-      lines.push(`📋 Задача: 🍎🥩 ГРАБЕЖ АМБАРА 🥖🧀${pct ? ' кол-во: ' + pct : ''} 📋`)
-    } else if (lowTask.startsWith('pillage inn')) {
-      const pct = extractBracketPart(taskRaw)
-      lines.push(`📋 Задача: 🍻 ГРАБЕЖ ТРАКТИРА 🍻${pct ? ' кол-во: ' + pct : ''} 📋`)
-    } else if (lowTask.startsWith('pillage armoury')) {
-      const pct = extractBracketPart(taskRaw)
-      lines.push(`📋 Задача: 🔫 ГРАБЕЖ ОРУЖЕЙНОЙ 🔫${pct ? ' кол-во: ' + pct : ''} 📋`)
-    } else if (lowTask.startsWith('pillage village hole')) {
-      const pct = extractBracketPart(taskRaw)
-      lines.push(`📋 Задача: 🍷🧂 ГРАБЕЖ БАНКЕТА 🪑🥻${pct ? ' кол-во: ' + pct : ''} 📋`)
-    } else if (lowTask === 'capture') {
-      lines.push('📋 Задача: ЗАХВАТ 📋')
-    } else if (lowTask === 'raze') {
-      lines.push('📋 Задача: УНИЧТОЖЕНИЕ 📋')
-    } else if (lowTask.startsWith('gold raid')) {
-      const pct = extractBracketPart(taskRaw)
-      lines.push(`📋 Задача: 💰 НАБЕГ ЗА ЗОЛОТОМ 💰${pct ? ' кол-во: ' + pct : ''} 📋`)
+    // для Scout/Monks часто в скобках просто число — это handled ниже
+    if (typeRaw.startsWith('scouts')) {
+      // извлечём число разведчиков, если есть
+      const countMatch = head.match(/Scouts\s*\(?\s*(\d+)\s*\)?/i)
+      const cnt = countMatch ? countMatch[1] : null
+      taskText = cnt ? `📋 Разведчик(и)[количество не определяеться]: ${cnt} 📋` : ''
+    } else if (typeRaw.startsWith('monks')) {
+      const countMatch = head.match(/Monks\s*\(?\s*(\d+)\s*\)?/i)
+      const cnt = countMatch ? countMatch[1] : null
+      taskText = cnt ? `📋 Монах(и): ${cnt} 📋` : ''
     } else {
-      lines.push(`📋 Задача: ${taskRaw} 📋`)
+      // fallback
+      taskText = ''
+    }
+  } else {
+    const t = taskRaw // e.g. "Attack" or "Ransack[1%]" or "Pillage Stockpile[90%]" or "Gold Raid[50%]" or "Capture" or "Raze"
+    const low = t.toLowerCase()
+    if (low === 'attack') {
+      taskText = '📋Задача: РАЗРУШЕНИЕ 📋'
+    } else if (low.startsWith('ransack')) {
+      // сохраним [X%] или [1%] часть если есть
+      const pct = t.match(/\[.*?\]/)
+      taskText = `📋 Задача: 🔥 ПОДЖЕГ 🔥${pct ? ' кол-во построек: ' + pct[0] : ''} 📋`
+    } else if (low.startsWith('pillage stockpile')) {
+      const pct = t.match(/\[.*?\]/)
+      taskText = `📋 Задача: 🪨🌳 ГРАБЕЖ СКЛАДА 🌳🪨${pct ? ' кол-во: ' + pct[0] : ''} 📋`
+    } else if (low.startsWith('pillage granary')) {
+      const pct = t.match(/\[.*?\]/)
+      taskText = `📋 Задача: 🍎🥩 ГРАБЕЖ АМБАРА 🥖🧀${pct ? ' кол-во: ' + pct[0] : ''} 📋`
+    } else if (low.startsWith('pillage inn')) {
+      const pct = t.match(/\[.*?\]/)
+      taskText = `📋 Задача: 🍻 ГРАБЕЖ ТРАКТИРА 🍻${pct ? ' кол-во: ' + pct[0] : ''} 📋`
+    } else if (low.startsWith('pillage armoury')) {
+      const pct = t.match(/\[.*?\]/)
+      taskText = `📋 Задача: 🔫 ГРАБЕЖ ОРУЖЕЙНОЙ 🔫${pct ? ' кол-во: ' + pct[0] : ''} 📋`
+    } else if (low.startsWith('pillage village hole')) {
+      const pct = t.match(/\[.*?\]/)
+      taskText = `📋 Задача: 🍷🧂 ГРАБЕЖ БАНКЕТА 🪑🥻${pct ? ' кол-во: ' + pct[0] : ''} 📋`
+    } else if (low.startsWith('capture')) {
+      taskText = '📋 Задача: ЗАХВАТ 📋'
+    } else if (low.startsWith('raze')) {
+      taskText = '📋 Задача: УНИЧТОЖЕНИЕ 📋'
+    } else if (low.startsWith('gold raid')) {
+      const pct = t.match(/\[.*?\]/)
+      taskText = `📋 Задача: 💰 НАБЕГ ЗА ЗОЛОТОМ 💰${pct ? ' кол-во: ' + pct[0] : ''} 📋`
+    } else if (/^\d+$/.test(t) && typeRaw.startsWith('scouts')) {
+      taskText = `📋 Разведчик(и)[количество не определяеться]: ${t} 📋`
+    } else {
+      // generic
+      taskText = `📋 Задача: ${t} 📋`
     }
   }
 
-  // common lines for attacker/defender/time
+  // 8) Форматируем итог (с учётом того, что для Scouts/Monks мы не хотим писать "нападает/оборона" как для армии — но по ТЗ поведение одинаковое за исключением заголовка)
+  // Создаём строки в требуемом формате
+  const lines = []
+  lines.push(header)
+  if (taskText) lines.push(taskText)
+  // Нападает: Имя ID id из village
   lines.push(`🗡 Нападает: ${attackerName} ID ${attackerId} из ${fromVillage} 🗡`)
+  // Обороняется: имя и ID — у тебя нужно: "2 Проток Дерьма ID 105065" — toVillage содержит "2 Проток Дерьма"
   lines.push(`🛡 Обороняеться: ${toVillage} ID ${defenderId} 🛡`)
   if (travelTime) lines.push(`⏰ Время пути: ${travelTime} ⏰`)
-
-  return lines.join('\n')
+  const result = lines.join('\n')
+  return result
 }
 // ----------------- end parser -----------------
 
@@ -399,6 +369,7 @@ async function sendTelegramNotification(text) {
     warnLog('⚠️ Не удалось отправить уведомление в Telegram: ' + (e?.message || e))
   }
 }
+
 async function onTelegramMessage(event) {
   try {
     const message = event.message
@@ -417,25 +388,32 @@ async function onTelegramMessage(event) {
     if (isFromSource && text && String(text).trim()) {
       infoLog('✉️ Получено из TG: ' + String(text).slice(0,200))
 
-      // Если радар выключен — не пересылаем автоматически
-      if (!radarActive) {
-        infoLog('ℹ️ Radar disabled — skipping auto-forward of TG message')
-        return
-      }
-
-      // Попробуем распарсить с помощью парсера. Если парсер вернул null — отправим оригинал
+      // Попробуем распарсить сообщение и отправить форматированное сообщение в WA (только если radarActive)
       try {
-        const formatted = parseTelegramMessage(String(text))
+        const formatted = parseTelegramMessage(String(text).trim())
         if (formatted) {
-          await sendToWhatsApp(formatted)
+          infoLog('ℹ️ Parsed TG -> formatted WA message:\n' + formatted.replace(/\n/g,' | '))
+          if (radarActive) {
+            // если WA не подключён — sendToWhatsApp вернёт false и мы просто логируем
+            const ok = await sendToWhatsApp(formatted)
+            if (!ok) {
+              warnLog('⚠️ Не удалось отправить parsed message в WA (WA offline или ошибка)')
+            }
+          } else {
+            infoLog('ℹ️ Radar выключен — сообщение распарсено но не отправлено (radarActive=false)')
+          }
         } else {
-          // fallback — отправляем оригинал (консервативный выбор)
-          await sendToWhatsApp(String(text))
+          // если не удалось распарсить — отправляем сырое сообщение (как раньше) только если radarActive
+          infoLog('ℹ️ Сообщение не подошло под шаблон парсера, пересылаем оригинал (если radarActive)')
+          if (radarActive) {
+            const ok = await sendToWhatsApp(String(text))
+            if (!ok) warnLog('⚠️ Не удалось отправить оригинал в WA (WA offline или ошибка)')
+          } else {
+            infoLog('ℹ️ Radar выключен — оригинал не отправлен')
+          }
         }
       } catch (e) {
-        warnLog('⚠️ Ошибка при форматировании/отправке TG message: ' + (e?.message || e))
-        // fallback — попытаемся отправить оригинал
-        try { await sendToWhatsApp(String(text)) } catch(e2){ warnLog('⚠️ fallback send failed: ' + (e2?.message || e2)) }
+        errorLog('❌ Ошибка в обработчике парсинга TG message: ' + (e?.message || e))
       }
     } else {
       // логируем непризнанные сообщения для отладки
@@ -1157,7 +1135,7 @@ app.get('/', (req, res) => {
     document.getElementById('btn_sendwa').onclick = async () => {
       const raw = document.getElementById('wa_text').value
       if(!raw || !raw.trim()) { alert('Введите текст'); return }
-      const wrapped = `[🔧service🔧]\n[Сообщение: ${raw}]`
+      const wrapped = \`[🔧service🔧]\\n[Сообщение: \${raw}]\`
       appendToLogBox('-> send to WA: ' + wrapped.slice(0,200))
       try {
         const r = await callApi('/wa/send', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ text: wrapped }) })
@@ -1170,7 +1148,7 @@ app.get('/', (req, res) => {
     document.getElementById('btn_tgsend').onclick = async () => {
       const raw = document.getElementById('tg_text').value
       if(!raw || !raw.trim()) { alert('Введите текст'); return }
-      const wrapped = `[🔧service🔧]\n[Сообщение: ${raw}]`
+      const wrapped = \`[🔧service🔧]\\n[Сообщение: \${raw}]\`
       appendToLogBox('-> send to TG: ' + wrapped.slice(0,200))
       try {
         const r = await callApi('/tg/send', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ text: wrapped }) })
