@@ -265,7 +265,7 @@ function parseTelegramMessage(raw) {
     } else if (low.startsWith('capture')) {
       taskText = '📋 Задача: ЗАХВАТ 📋'
     } else if (low.startsWith('raze')) {
-      taskText = '📋 Задача: УНИЧТОЖЕНИЕ 📋'
+      taskText = '📋 Задача: СТИРАНИЕ 📋'
     } else if (low.startsWith('gold raid')) {
       const pct = t.match(/\[.*?\]/)
       taskText = `📋 Задача: 💰 НАБЕГ ЗА ЗОЛОТОМ 💰${pct ? ' кол-во: ' + pct[0] : ''} 📋`
