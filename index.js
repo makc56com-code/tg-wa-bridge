@@ -195,7 +195,7 @@ function parseTelegramMessage(raw) {
     if (s.startsWith('scouts to capital') || s.includes('scouts to capital')) return '🐎🌆 РАЗВЕДКА ГОРОДА 🌃🐎'
     if (s.startsWith('scouts')) return '🐎 РАЗВЕДКА 🐎'
     if (s.startsWith('monks to capital') || s.includes('monks to capital')) return '☦🌆 МОНАХ ПРИБЫВАЕТ В ГОРОД 🌃☦'
-    if (s.startsWith('monks')) return '☦ МОНАХ ☦'
+    if (s.startsWith('monks')) return '☦ МОНАХ ПРИБЫВАЕТ В ДЕРЕВНЮ ☦'
     return '⚔ СООБЩЕНИЕ ⚔'
   }
   const header = mapTypeToHeader(typeRaw)
@@ -229,14 +229,16 @@ function parseTelegramMessage(raw) {
       // извлечём число разведчиков, если есть
       const countMatch = head.match(/Scouts\s*\(?\s*(\d+)\s*\)?/i)
       const cnt = countMatch ? countMatch[1] : null
-      taskText = cnt ? `📋 Разведчик(и)[количество не определяеться]: ${cnt} 📋` : ''
-    } else if (typeRaw.startsWith('monks')) {
-      const countMatch = head.match(/Monks\s*\(?\s*(\d+)\s*\)?/i)
-      const cnt = countMatch ? countMatch[1] : null
-      taskText = cnt ? `📋 Монах(и): ${cnt} 📋` : ''
-    } else {
-      // fallback
-      taskText = ''
+      taskText = cnt ? `📋 Разведчик(и):[количество не определяеться]: ${cnt} 📋` : ''
+    } const mCnt = head.match(/Monks\s*\(?\s*(\d+)\s*\)?/i)
+    const cnt = mCnt ? mCnt[1] : null
+    lines.push(`📋 Задача: [не определяеться] 📋`)
+    lines.push(`📋 Количество монахов: ${cnt ? cnt : '[не указано]'} 📋`)
+    lines.push(`🗡 Нападает: ${attackerName} ID ${attackerId} из ${fromVillage} 🗡`)
+    lines.push(`🛡 Обороняеться: ${toVillage} ID ${defenderId} 🛡`)
+    if (travelTime) lines.push(`⏰ Время пути: ${travelTime} ⏰`)
+    return lines.join('\n')
+  }
     }
   } else {
     const t = taskRaw // e.g. "Attack" or "Ransack[1%]" or "Pillage Stockpile[90%]" or "Gold Raid[50%]" or "Capture" or "Raze"
@@ -270,7 +272,7 @@ function parseTelegramMessage(raw) {
       const pct = t.match(/\[.*?\]/)
       taskText = `📋 Задача: 💰 НАБЕГ ЗА ЗОЛОТОМ 💰${pct ? ' кол-во: ' + pct[0] : ''} 📋`
     } else if (/^\d+$/.test(t) && typeRaw.startsWith('scouts')) {
-      taskText = `📋 Разведчик(и)[количество не определяеться]: ${t} 📋`
+      taskText = `📋 Разведчик(и): [количество не определяеться]: ${t} 📋`
     } else {
       // generic
       taskText = `📋 Задача: ${t} 📋`
