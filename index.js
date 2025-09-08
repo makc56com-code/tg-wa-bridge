@@ -1,7 +1,7 @@
 // index.js (полностью обновлённый — UI и логика Radar включены)
 // Я внёс минимальные изменения в остальную логику: добавил флаг radarActive, эндпоинты для включения/выключения радара,
 // UI-кнопки и поправил CSS для "Краткий статус", чтобы ничего не вылазило за границы.
-// Всё остальное — оригинальный код с небольшими адаптациями (отправка welcome только если radarActive).
+// Теперь добавлен парсер сообщений из Telegram (форматирование и отправка в WA).
 import 'dotenv/config'
 import express from 'express'
 import makeWASocket, {
@@ -157,6 +157,141 @@ function stripNonAlnum(s){
   return String(s || '').toLowerCase().replace(/[^a-z0-9а-яё]+/gi,'').trim()
 }
 
+// ----------------- PARSER: Telegram -> formatted WA message -----------------
+/**
+ * parseTelegramMessage(rawText)
+ * возвращает строку (готовую к отправке в WA) или null если не парсится
+ */
+function parseTelegramMessage(raw) {
+  if (!raw || typeof raw !== 'string') return null
+  let msg = String(raw).trim()
+
+  // 1) отбросим префикс [Global Realm N]
+  msg = msg.replace(/^\[Global Realm\s*\d+\]\s*/i, '').trim()
+
+  // 2) найдем позицию From[ — всё до неё содержит тип и (задачу)
+  const fromIdx = msg.indexOf('From[')
+  if (fromIdx === -1) {
+    // Иногда исходный текст может отличаться — вернём null, чтобы сохранить оригинал
+    return null
+  }
+  const head = msg.slice(0, fromIdx).trim() // например "Attack (Attack)" или "Captain (Pillage Stockpile[90%])" или "Scouts (1)"
+  const tail = msg.slice(fromIdx).trim() // начиная с "From[...]" до конца, содержит также time после '|'
+
+  // 3) извлечём задачу в скобках, если есть
+  const taskMatch = head.match(/\(([^)]+)\)/)
+  const taskRaw = taskMatch ? taskMatch[1].trim() : null
+
+  // 4) извлечём основной тип (например Attack, Captain, Scouts, Monks, Attack to Capital, Scouts to Capital, Monks to Capital)
+  const typeRaw = head.replace(/\([^)]+\)/, '').trim().toLowerCase()
+
+  // 5) применим отображения типов в заголовок
+  function mapTypeToHeader(t) {
+    if (!t) return '⚔ СООБЩЕНИЕ ⚔'
+    const s = t.toLowerCase()
+    if (s.startsWith('captain')) return '⚔ ВНИМАНИЕ КАПИТАН ⚔'
+    if (s.startsWith('attack to capital') || s.includes('attack to capital')) return '⚔ ВНИМАНИЕ АТАКА НА ГОРОД ⚔'
+    if (s.startsWith('attack')) return '⚔ ВНИМАНИЕ АРМИЯ ⚔'
+    if (s.startsWith('scouts to capital') || s.includes('scouts to capital')) return '🐎 РАЗВЕДКА ГОРОДА🐎'
+    if (s.startsWith('scouts')) return '🐎 РАЗВЕДКА 🐎'
+    if (s.startsWith('monks to capital') || s.includes('monks to capital')) return '☦ МОНАХ В ГОРОД ☦'
+    if (s.startsWith('monks')) return '☦ МОНАХ ☦'
+    return '⚔ СООБЩЕНИЕ ⚔'
+  }
+  const header = mapTypeToHeader(typeRaw)
+
+  // 6) разобъём tail: From[AttackerName][AttackerId] <fromVillage> to [DefId] <toVillage> | time
+  // пример tail: From[СексКАМАЗ][25460] 01 УБ Дрочильня to [105065] 2 Проток Дерьма| 00:04:23
+  // regex позволит захватить группы аккуратно
+  const tailRegex = /From\[(.*?)\]\[(\d+)\]\s+(.+?)\s+to\s+\[(\d+)\]\s+(.+?)(?:\s*\|\s*([0-9]{2}:[0-9]{2}:[0-9]{2}))?$/i
+  const tailMatch = tail.match(tailRegex)
+  if (!tailMatch) {
+    // если основной шаблон не подошёл — попытаемся вытащить время и части альтернативно
+    // попробуем найти time в конце
+    const timeAlt = msg.match(/([0-9]{2}:[0-9]{2}:[0-9]{2})\s*$/)
+    const timeStr = timeAlt ? timeAlt[1] : ''
+    // попроще — не парсим, отдаём null чтобы не ломать поток
+    return null
+  }
+
+  const attackerName = tailMatch[1] || ''
+  const attackerId = tailMatch[2] || ''
+  const fromVillage = (tailMatch[3] || '').trim()
+  const defenderId = tailMatch[4] || ''
+  const toVillage = (tailMatch[5] || '').trim()
+  const travelTime = (tailMatch[6] || '').trim()
+
+  // 7) сформируем строку "задачи" (taskText) по входному taskRaw
+  let taskText = ''
+  if (!taskRaw) {
+    // для Scout/Monks часто в скобках просто число — это handled ниже
+    if (typeRaw.startsWith('scouts')) {
+      // извлечём число разведчиков, если есть
+      const countMatch = head.match(/Scouts\s*\(?\s*(\d+)\s*\)?/i)
+      const cnt = countMatch ? countMatch[1] : null
+      taskText = cnt ? `📋 Разведчик(и): ${cnt} 📋` : ''
+    } else if (typeRaw.startsWith('monks')) {
+      const countMatch = head.match(/Monks\s*\(?\s*(\d+)\s*\)?/i)
+      const cnt = countMatch ? countMatch[1] : null
+      taskText = cnt ? `📋 Монах(и): ${cnt} 📋` : ''
+    } else {
+      // fallback
+      taskText = ''
+    }
+  } else {
+    const t = taskRaw // e.g. "Attack" or "Ransack[1%]" or "Pillage Stockpile[90%]" or "Gold Raid[50%]" or "Capture" or "Raze"
+    const low = t.toLowerCase()
+    if (low === 'attack') {
+      taskText = '📋Задача: РАЗРУШЕНИЕ 📋'
+    } else if (low.startsWith('ransack')) {
+      // сохраним [X%] или [1%] часть если есть
+      const pct = t.match(/\[.*?\]/)
+      taskText = `📋 Задача: 🔥 ПОДЖЕГ 🔥${pct ? ' кол-во построек: ' + pct[0] : ''} 📋`
+    } else if (low.startsWith('pillage stockpile')) {
+      const pct = t.match(/\[.*?\]/)
+      taskText = `📋 Задача: 🪨🌳 ГРАБЕЖ СКЛАДА 🌳🪨${pct ? ' кол-во: ' + pct[0] : ''} 📋`
+    } else if (low.startsWith('pillage granary')) {
+      const pct = t.match(/\[.*?\]/)
+      taskText = `📋 Задача: 🍎🥩 ГРАБЕЖ АМБАРА 🥖🧀${pct ? ' кол-во: ' + pct[0] : ''} 📋`
+    } else if (low.startsWith('pillage inn')) {
+      const pct = t.match(/\[.*?\]/)
+      taskText = `📋 Задача: 🍻 ГРАБЕЖ ТРАКТИРА 🍻${pct ? ' кол-во: ' + pct[0] : ''} 📋`
+    } else if (low.startsWith('pillage armoury')) {
+      const pct = t.match(/\[.*?\]/)
+      taskText = `📋 Задача: 🔫 ГРАБЕЖ ОРУЖЕЙНОЙ 🔫${pct ? ' кол-во: ' + pct[0] : ''} 📋`
+    } else if (low.startsWith('pillage village hole')) {
+      const pct = t.match(/\[.*?\]/)
+      taskText = `📋 Задача: 🍷🧂 ГРАБЕЖ БАНКЕТА 🪑🥻${pct ? ' кол-во: ' + pct[0] : ''} 📋`
+    } else if (low.startsWith('capture')) {
+      taskText = '📋 Задача: ЗАХВАТ 📋'
+    } else if (low.startsWith('raze')) {
+      taskText = '📋 Задача: УНИЧТОЖЕНИЕ (RAZE) 📋'
+    } else if (low.startsWith('gold raid')) {
+      const pct = t.match(/\[.*?\]/)
+      taskText = `📋 Задача: 💰 НАБЕГ ЗА ЗОЛОТОМ 💰${pct ? ' кол-во: ' + pct[0] : ''} 📋`
+    } else if (/^\d+$/.test(t) && typeRaw.startsWith('scouts')) {
+      taskText = `📋 Разведчик(и): ${t} 📋`
+    } else {
+      // generic
+      taskText = `📋 Задача: ${t} 📋`
+    }
+  }
+
+  // 8) Форматируем итог (с учётом того, что для Scouts/Monks мы не хотим писать "нападает/оборона" как для армии — но по ТЗ поведение одинаковое за исключением заголовка)
+  // Создаём строки в требуемом формате
+  const lines = []
+  lines.push(header)
+  if (taskText) lines.push(taskText)
+  // Нападает: Имя ID id из village
+  lines.push(`🗡 Нападает: ${attackerName} ID ${attackerId} из ${fromVillage} 🗡`)
+  // Обороняется: имя и ID — у тебя нужно: "2 Проток Дерьма ID 105065" — toVillage содержит "2 Проток Дерьма"
+  lines.push(`🛡 Обороняеться: ${toVillage} ID ${defenderId} 🛡`)
+  if (travelTime) lines.push(`⏰ Время пути: ${travelTime} ⏰`)
+  const result = lines.join('\n')
+  return result
+}
+// ----------------- end parser -----------------
+
 // ---- Gist helpers ----
 async function loadAuthFromGistToDir(dir) {
   if (!GITHUB_TOKEN || !GIST_ID) {
@@ -234,6 +369,7 @@ async function sendTelegramNotification(text) {
     warnLog('⚠️ Не удалось отправить уведомление в Telegram: ' + (e?.message || e))
   }
 }
+
 async function onTelegramMessage(event) {
   try {
     const message = event.message
@@ -251,7 +387,34 @@ async function onTelegramMessage(event) {
 
     if (isFromSource && text && String(text).trim()) {
       infoLog('✉️ Получено из TG: ' + String(text).slice(0,200))
-      await sendToWhatsApp(String(text))
+
+      // Попробуем распарсить сообщение и отправить форматированное сообщение в WA (только если radarActive)
+      try {
+        const formatted = parseTelegramMessage(String(text).trim())
+        if (formatted) {
+          infoLog('ℹ️ Parsed TG -> formatted WA message:\n' + formatted.replace(/\n/g,' | '))
+          if (radarActive) {
+            // если WA не подключён — sendToWhatsApp вернёт false и мы просто логируем
+            const ok = await sendToWhatsApp(formatted)
+            if (!ok) {
+              warnLog('⚠️ Не удалось отправить parsed message в WA (WA offline или ошибка)')
+            }
+          } else {
+            infoLog('ℹ️ Radar выключен — сообщение распарсено но не отправлено (radarActive=false)')
+          }
+        } else {
+          // если не удалось распарсить — отправляем сырое сообщение (как раньше) только если radarActive
+          infoLog('ℹ️ Сообщение не подошло под шаблон парсера, пересылаем оригинал (если radarActive)')
+          if (radarActive) {
+            const ok = await sendToWhatsApp(String(text))
+            if (!ok) warnLog('⚠️ Не удалось отправить оригинал в WA (WA offline или ошибка)')
+          } else {
+            infoLog('ℹ️ Radar выключен — оригинал не отправлен')
+          }
+        }
+      } catch (e) {
+        errorLog('❌ Ошибка в обработчике парсинга TG message: ' + (e?.message || e))
+      }
     } else {
       // логируем непризнанные сообщения для отладки
       if (text && String(text).trim()) {
