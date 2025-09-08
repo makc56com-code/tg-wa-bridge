@@ -1,0 +1,13 @@
+config.js — переменные окружения, пути, константы.
+
+logger.js — фильтр логов + infoLog, warnLog, errorLog.
+
+telegram.js — подключение TG, обработка входящих, пересылка в WA.
+
+whatsapp.js — подключение WA, обработка событий, пересылка в TG, sendToWhatsApp.
+
+routes.js — все app.get/post(...) для API + radar endpoints.
+
+ui.js — HTML с интерфейсом (сейчас он внутри app.get('/')).
+
+index.js — только сборка: импорт модулей, запуск TG/WA, подключение routes, UI, listen.
